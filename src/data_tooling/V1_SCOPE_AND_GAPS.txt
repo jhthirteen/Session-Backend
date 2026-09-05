@@ -1,0 +1,80 @@
+NLP Visualizer V1 — Scope and Known Gaps
+==========================================
+(Checkpoint 3 status; generated 2026-09-05. Do not treat this file as a roadmap
+commitment — it is a snapshot of what the toolbelt can and cannot do today.)
+
+HANDLED (7 intents + clarification) — updated 2026-09-05: history trends built
+--------------------------------------------------------------------------------
+1. player_season_avg   — one player, one season, per-game averages
+                         (PlayerCareerStats, PerMode=PerGame)
+2. player_game_logs    — one player, last-N games (PlayerGameLog, default N=10)
+3. team_stats          — one team, one season W/L record (TeamYearByYearStats)
+4. team_game_logs      — one team, last-N games (TeamGameLog, default N=10)
+5. compare_players     — 2+ players, one season, side-by-side averages (fan-out;
+                         partial rows kept when one player has no data, e.g.
+                         injury-missed season)
+6. player_career_trend — season-by-season history, ONE PlayerCareerStats call
+                         (per-game OR totals; last-N / since-season windows;
+                         traded years collapse to TOT row; viz trend_line,
+                         chartable in both modes; most-improved wording adds
+                         highlight_season + highlight_note via max YoY delta)
+7. team_history_trend  — year-by-year history, ONE TeamYearByYearStats call
+                         (windows; W/L aliases; unified SEASON key; trend_line)
+8. needs_clarification — ambiguous/unknown names, unresolvable seasons,
+                         non-statistical queries. Never guesses.
+
+The Groq agent (agent.py) has exactly these 5 tools (nba_tools.py:TOOL_FUNCS).
+It cannot fetch anything else; it can only phrase these 5 in different words.
+
+OUT OF SCOPE (will clarify or answer awkwardly)
+----------------------------------------------
+- Team-vs-team comparisons (no compare_teams tool; "Celtics vs Lakers record"
+  has no first-class path — expect two get_team_stats calls or a fumbled answer).
+- League-wide: standings, scoring/assist leaders ("who leads the league in..."),
+  playoff picture, franchise history.
+- Game-specific: box scores, play-by-play, shot charts, "who won last night",
+  live scores (no live endpoints wired).
+- Advanced metrics: PER, true shooting %, usage %, plus/minus, clutch splits,
+  on/off ratings, hustle stats.
+- Multi-season trends: BUILT 2026-09-05 (player_career_trend /
+  team_history_trend, one bulk call each, trend_line viz). Career-peak
+  questions answered from max-of-rows; most-improved via max YoY delta.
+- Totals / Per36 (PerGame is hardcoded in get_player_season_averages).
+- Playoffs / preseason / All-Star (SeasonType is hardcoded to "Regular Season").
+- Non-stats: injuries, trades, transactions, predictions, opinions
+  ("will the Knicks win it all", "who should win MVP").
+- WNBA / college / G-League / draft / awards voting.
+- Multi-hop questions ("how did the team that beat the Celtics do next game").
+
+HARDCODED ASSUMPTIONS
+---------------------
+- Season format YYYY-YY only (e.g. 2025-26). "Last season" resolves against
+  today's date; offseason maps to the most recently completed season.
+- "Rookie year" without career context resolves to None (needs lookup).
+- last_n clamped to 1-82, default 10.
+- 30s timeout + 1 retry per NBA call; 1-hour in-memory TTL cache (no persistence).
+- Regular season only. Single season per query. No auth/rate-limiting on our side.
+
+GRAY ZONE (works, but loosely — tighten only on request)
+--------------------------------------------------------
+- Bare last names ("brunson") — Groq infers the famous active player (Jalen)
+  instead of forcing disambiguation (Jalen vs Rick). Good UX, softens the
+  "never guess" rule. Tighten via system prompt if strictness is preferred.
+- Metric synonyms outside the map ("double-doubles", "efficiency") fall back
+  to PTS default or nearest key.
+- Unknown names ("Mickey Mouse") correctly return needs_clarification with
+  zero rows and no hallucinated stats (verified live).
+
+ENVIRONMENT NOTE
+----------------
+- nba_api 1.10.2 pinned (repo .venv is Python 3.9.13; nba_api >= 1.11 requires
+  Python >= 3.10). Upgrading Python unlocks latest nba_api.
+- Model default: openai/gpt-oss-120b via Groq (override with GROQ_MODEL env var).
+
+SUGGESTED NEXT MILESTONES (not started)
+---------------------------------------
+1. Checkpoint 4 follow-up: verify trend intents through POST /api/nlp/query
+   (no api.py change needed — QueryResponse carries the new fields).
+2. compare_teams + LeagueStandings + LeagueLeaders tools.
+3. BoxScoreTraditionalV2 for single-game questions.
+4. Persistent cache + FastAPI rate limiting.
