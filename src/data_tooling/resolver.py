@@ -400,6 +400,16 @@ _SINCE_SEASON_RE = re.compile(
 _TOTALS_RE = re.compile(
     r"\btotals?\b|\bcombined\b|\baltogether\b|\bcumulative\b", re.I
 )
+_COMPARISON_RE = re.compile(
+    r"\bcompar(e|ison|ing)\b|\bvs\.?\b|\bversus\b|\bbetween\b"
+    r"|\bbetter\b|\bhead.to.head\b|\bhead to head\b|\bwho('s| is) (better|greater)\b",
+    re.I,
+)
+
+
+def detect_comparison_intent(text: str) -> bool:
+    """True when the query compares multiple things (entities, seasons, games)."""
+    return bool(_COMPARISON_RE.search(text))
 
 
 def detect_trend_intent(text: str) -> bool:
@@ -519,6 +529,32 @@ def choose_viz_hint(spec: QuerySpec) -> VizHint:
                 window = f"{spec.seasons[0]} to {spec.seasons[-1]}"
         title = f"{label} {'/'.join(metrics)} {flavor} by season {window}".strip()
         return VizHint(type="trend_line", title=title, x_key="SEASON", y_keys=metrics)
+    if spec.intent == "compare_trends":
+        series_key = "TEAM_NAME" if spec.teams and not spec.players else "PLAYER_NAME"
+        flavor = "totals" if getattr(spec, "per_mode", "PerGame") == "Totals" else "per game"
+        window = ""
+        if getattr(spec, "seasons", None):
+            if len(spec.seasons) > 1:
+                window = f"{spec.seasons[0]} to {spec.seasons[-1]}"
+            elif spec.seasons:
+                window = spec.seasons[0]
+        who = ", ".join(spec.players or spec.teams) or label
+        title = f"{who} {'/'.join(metrics)} {flavor} by season {window}".strip()
+        return VizHint(
+            type="multi_trend",
+            title=title,
+            x_key="SEASON",
+            y_keys=metrics,
+            series_key=series_key,
+        )
+    if spec.intent == "compare_teams":
+        return VizHint(
+            type="comparison_bars",
+            title=f"{' vs '.join(spec.teams)} {season} ({'/'.join(metrics)})".strip(),
+            x_key="TEAM_NAME",
+            y_keys=metrics,
+            series_key="TEAM_NAME",
+        )
     if spec.intent == "player_season_avg" and len(spec.players) == 1:
         return VizHint(
             type="single_stat",
@@ -529,7 +565,9 @@ def choose_viz_hint(spec: QuerySpec) -> VizHint:
         return VizHint(
             type="comparison_bars",
             title=f"{' vs '.join(spec.players)} {season} ({'/'.join(metrics)})".strip(),
+            x_key="PLAYER_NAME",
             y_keys=metrics,
+            series_key="PLAYER_NAME",
         )
     if spec.intent in ("player_game_logs", "team_game_logs"):
         return VizHint(

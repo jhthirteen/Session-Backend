@@ -3,7 +3,7 @@ NLP Visualizer V1 — Scope and Known Gaps
 (Checkpoint 3 status; generated 2026-09-05. Do not treat this file as a roadmap
 commitment — it is a snapshot of what the toolbelt can and cannot do today.)
 
-HANDLED (7 intents + clarification) — updated 2026-09-05: history trends built
+HANDLED (10 intents + clarification) — updated 2026-09-06: comparisons built
 --------------------------------------------------------------------------------
 1. player_season_avg   — one player, one season, per-game averages
                          (PlayerCareerStats, PerMode=PerGame)
@@ -13,14 +13,21 @@ HANDLED (7 intents + clarification) — updated 2026-09-05: history trends built
 5. compare_players     — 2+ players, one season, side-by-side averages (fan-out;
                          partial rows kept when one player has no data, e.g.
                          injury-missed season)
-6. player_career_trend — season-by-season history, ONE PlayerCareerStats call
+6. compare_teams       — 2-4 teams, one season W/L/W_PCT (fan-out; viz
+                         comparison_bars with x_key=TEAM_NAME)
+7. compare_trends      — 2-4 players or teams over seasons in ONE bulk call
+                         (compare_player_career_trends / compare_team_histories;
+                         rows tagged PLAYER_NAME/TEAM_NAME; viz multi_trend with
+                         series_key; legacy per-player trend calls route here too;
+                         max 4 entities, else clarification)
+8. player_career_trend — season-by-season history, ONE PlayerCareerStats call
                          (per-game OR totals; last-N / since-season windows;
                          traded years collapse to TOT row; viz trend_line,
                          chartable in both modes; most-improved wording adds
                          highlight_season + highlight_note via max YoY delta)
-7. team_history_trend  — year-by-year history, ONE TeamYearByYearStats call
+9. team_history_trend  — year-by-year history, ONE TeamYearByYearStats call
                          (windows; W/L aliases; unified SEASON key; trend_line)
-8. needs_clarification — ambiguous/unknown names, unresolvable seasons,
+10. needs_clarification — ambiguous/unknown names, unresolvable seasons,
                          non-statistical queries. Never guesses.
 
 The Groq agent (agent.py) has exactly these 5 tools (nba_tools.py:TOOL_FUNCS).
@@ -28,14 +35,15 @@ It cannot fetch anything else; it can only phrase these 5 in different words.
 
 OUT OF SCOPE (will clarify or answer awkwardly)
 ----------------------------------------------
-- Team-vs-team comparisons (no compare_teams tool; "Celtics vs Lakers record"
-  has no first-class path — expect two get_team_stats calls or a fumbled answer).
 - League-wide: standings, scoring/assist leaders ("who leads the league in..."),
   playoff picture, franchise history.
 - Game-specific: box scores, play-by-play, shot charts, "who won last night",
   live scores (no live endpoints wired).
 - Advanced metrics: PER, true shooting %, usage %, plus/minus, clutch splits,
   on/off ratings, hustle stats.
+- Multi-entity last-N-games overlays ("Brunson vs Haliburton last 5 games"):
+  no tool yet — agent answers from two game-log calls; frontend pivots them
+  into one chart via series detection (backend path TBD).
 - Multi-season trends: BUILT 2026-09-05 (player_career_trend /
   team_history_trend, one bulk call each, trend_line viz). Career-peak
   questions answered from max-of-rows; most-improved via max YoY delta.

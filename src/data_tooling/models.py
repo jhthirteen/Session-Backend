@@ -20,6 +20,8 @@ Intent = Literal[
     "team_stats",
     "team_game_logs",
     "compare_players",
+    "compare_teams",
+    "compare_trends",
     "player_career_trend",
     "team_history_trend",
     "needs_clarification",
@@ -27,11 +29,12 @@ Intent = Literal[
 
 VizType = Literal[
     "single_stat",  # one big number, e.g. Brunson PPG 2024-25
-    "comparison_bars",  # 2+ players/teams side-by-side
+    "comparison_bars",  # 2+ entities side-by-side (x_key says which axis)
     "time_series",  # game-by-game line chart
     "game_log_table",  # last-N games table
     "team_stat_card",  # team record + ratings card
     "trend_line",  # season-by-season line chart (x=SEASON, chartable per-game or totals)
+    "multi_trend",  # 2+ entities over time — one line per series_key value
 ]
 
 # Canonical metric keys (match nba_api column names where possible).
@@ -102,10 +105,17 @@ class VizHint(BaseModel):
     type: VizType
     title: str
     x_key: Optional[str] = Field(
-        default=None, description="E.g. 'GAME_DATE' for time_series."
+        default=None,
+        description="X-axis key: 'GAME_DATE' (time_series), 'SEASON' (trends), "
+        "'PLAYER_NAME'/'TEAM_NAME' (comparison_bars snapshots).",
     )
     y_keys: List[str] = Field(
         default_factory=list, description="E.g. ['PTS'] or ['PTS', 'AST']."
+    )
+    series_key: Optional[str] = Field(
+        default=None,
+        description="Compare discriminator: 'PLAYER_NAME' / 'TEAM_NAME' / "
+        "'SEASON'. Null = single series (legacy behavior).",
     )
 
 
