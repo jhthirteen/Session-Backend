@@ -302,6 +302,106 @@ def compare_players(
     return rows
 
 
+# Max entities per compare call — keeps NBA fan-out latency sane and charts
+# readable. More than this → ToolError so the agent asks to narrow down.
+MAX_COMPARE_ENTITIES = 4
+
+
+def _check_entity_cap(names: List[str], kind: str) -> None:
+    if len(names) > MAX_COMPARE_ENTITIES:
+        raise ToolError(
+            f"Too many {kind} to compare ({len(names)}). "
+            f"Pick up to {MAX_COMPARE_ENTITIES}."
+        )
+
+
+def compare_teams(
+    teams: List[str], season: str, metrics: Optional[List[str]] = None
+) -> List[Dict[str, Any]]:
+    """Fan-out: season rows for 2+ teams (W/L/W_PCT + requested metrics).
+
+    Mirrors compare_players so team-vs-team snapshots ("Celtics vs Lakers
+    record last season") have a first-class path instead of two loose
+    get_team_stats calls.
+    """
+    metrics = metrics or ["W", "L", "W_PCT"]
+    _check_entity_cap(teams, "teams")
+    rows: List[Dict[str, Any]] = []
+    for name in teams:
+        try:
+            full = get_team_stats(name, season)
+        except ToolError as e:
+            rows.append({"TEAM_NAME": name, "SEASON": season, "error": str(e)})
+            continue
+        trimmed: Dict[str, Any] = {
+            "TEAM_NAME": full.get("TEAM_NAME", name),
+            "SEASON": season,
+        }
+        for m in metrics:
+            trimmed[m] = full.get(m)
+        rows.append(trimmed)
+    return rows
+
+
+def compare_player_career_trends(
+    players: List[str],
+    per_mode: str = "PerGame",
+    last_n_seasons: Optional[int] = None,
+    since_season: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Season-by-season histories for 2+ players in one call.
+
+    Generalizes get_player_career_trend to the entity x time matrix
+    ("Tatum vs Brown PPG throughout their careers"). Rows carry PLAYER_NAME
+    so the frontend pivots one line per player over the union of seasons.
+    """
+    _check_entity_cap(players, "players")
+    rows: List[Dict[str, Any]] = []
+    for name in players:
+        try:
+            rows.extend(
+                get_player_career_trend(
+                    name,
+                    per_mode=per_mode,
+                    last_n_seasons=last_n_seasons,
+                    since_season=since_season,
+                )
+            )
+        except ToolError as e:
+            rows.append({"PLAYER_NAME": name, "error": str(e)})
+    if not rows:
+        raise ToolError("No career stats found for those players.")
+    return rows
+
+
+def compare_team_histories(
+    teams: List[str],
+    last_n_seasons: Optional[int] = None,
+    since_season: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Year-by-year histories for 2+ teams in one call.
+
+    Rows carry TEAM_NAME + unified SEASON so the frontend pivots one line
+    per team over the union of seasons.
+    """
+    _check_entity_cap(teams, "teams")
+    rows: List[Dict[str, Any]] = []
+    for name in teams:
+        try:
+            rows.extend(
+                get_team_history_trend(
+                    name,
+                    last_n_seasons=last_n_seasons,
+                    since_season=since_season,
+                )
+            )
+        except ToolError as e:
+            rows.append({"TEAM_NAME": name, "error": str(e)})
+    if not rows:
+        raise ToolError("No history found for those teams.")
+    return rows
+
+
 def _normalize_row(record: Dict[str, Any]) -> Dict[str, Any]:
     return {k: (v.item() if hasattr(v, "item") else v) for k, v in record.items()}
 
@@ -433,6 +533,9 @@ TOOL_FUNCS: Dict[str, Callable[..., Any]] = {
     "get_team_stats": get_team_stats,
     "get_team_game_logs": get_team_game_logs,
     "compare_players": compare_players,
+    "compare_teams": compare_teams,
+    "compare_player_career_trends": compare_player_career_trends,
+    "compare_team_histories": compare_team_histories,
     "get_player_career_trend": get_player_career_trend,
     "get_team_history_trend": get_team_history_trend,
 }
@@ -523,14 +626,88 @@ GROQ_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "get_player_career_trend",
-            "description": (
-                "Get season-by-season history for one player in a SINGLE call. "
-                "USE THIS for any career/multi-season question "
-                "(best season ever, year by year, over his career, progression, "
-                "most improved, totals across seasons) — NEVER loop "
-                "get_player_season_averages per season."
-            ),
+                "name": "compare_teams",
+                "description": "Season stats (W/L/W_PCT) for 2-4 teams, one season.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "teams": {"type": "array", "items": {"type": "string"}},
+                    "season": {"type": "string", "description": "'YYYY-YY'"},
+                    "metrics": {
+                        "type": ["array", "null"],
+                        "items": {"type": "string"},
+                        "description": "E.g. ['W','L','W_PCT']. Omit for default.",
+                    },
+                },
+                "required": ["teams", "season"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+                "name": "compare_player_career_trends",
+                "description": (
+                    "Season-by-season histories for 2-4 players in ONE call. "
+                    "Use for multi-player career questions; never loop the "
+                    "single-player trend tool."
+                ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "players": {"type": "array", "items": {"type": "string"}},
+                    "per_mode": {
+                        "type": ["string", "null"],
+                        "enum": ["PerGame", "Totals", None],
+                        "description": "Per-game (default) or Totals. Omit if unsure.",
+                    },
+                    "last_n_seasons": {
+                        "type": ["integer", "null"],
+                        "description": "Optional window, e.g. 5. Omit for full history.",
+                    },
+                    "since_season": {
+                        "type": ["string", "null"],
+                        "description": "Optional cutoff 'YYYY-YY'. Omit for full history.",
+                    },
+                },
+                "required": ["players"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+                "name": "compare_team_histories",
+                "description": (
+                    "Year-by-year histories for 2-4 teams in ONE call. "
+                    "Use for team-vs-team over time; never loop get_team_stats."
+                ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "teams": {"type": "array", "items": {"type": "string"}},
+                    "last_n_seasons": {
+                        "type": ["integer", "null"],
+                        "description": "Optional window. Omit for full history.",
+                    },
+                    "since_season": {
+                        "type": ["string", "null"],
+                        "description": "Optional cutoff 'YYYY-YY'. Omit for full history.",
+                    },
+                },
+                "required": ["teams"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+                "name": "get_player_career_trend",
+                "description": (
+                    "Season-by-season history for ONE player in a SINGLE call. "
+                    "Use for any career/multi-season question; never loop "
+                    "single-season tools per season."
+                ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -538,15 +715,15 @@ GROQ_TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "per_mode": {
                         "type": ["string", "null"],
                         "enum": ["PerGame", "Totals", None],
-                        "description": "Per-game averages (default) or season totals. Omit if unsure.",
+                        "description": "Per-game (default) or Totals. Omit if unsure.",
                     },
                     "last_n_seasons": {
                         "type": ["integer", "null"],
-                        "description": "Optional window, e.g. 5 for 'last 5 seasons'. Omit for full history.",
+                        "description": "Optional window, e.g. 5. Omit for full history.",
                     },
                     "since_season": {
                         "type": ["string", "null"],
-                        "description": "Optional cutoff 'YYYY-YY', e.g. '2020-21' for 'since 2020'. Omit for full history.",
+                        "description": "Optional cutoff 'YYYY-YY'. Omit for full history.",
                     },
                 },
                 "required": ["player_name"],
@@ -556,13 +733,11 @@ GROQ_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "get_team_history_trend",
-            "description": (
-                "Get year-by-year history for one team in a SINGLE call. USE THIS "
-                "for any multi-season team question (wins by year, record over "
-                "time, best season in franchise stretch) — NEVER loop "
-                "get_team_stats per season."
-            ),
+                "name": "get_team_history_trend",
+                "description": (
+                    "Year-by-year history for ONE team in a SINGLE call. "
+                    "Use for multi-season team questions; never loop get_team_stats."
+                ),
             "parameters": {
                 "type": "object",
                 "properties": {

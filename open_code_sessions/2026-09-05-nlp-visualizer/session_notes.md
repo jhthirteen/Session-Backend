@@ -145,3 +145,60 @@ list, hardcoded assumptions, gray zone) at user's request — no code changes wi
   nba-api/pandas, Groq key — were user-side).
 - Lazy `nba_api` imports preserved so modules import cleanly without deps.
 
+---
+
+## Continued session 2026-09-06 — comparisons + TPM fix (backend half)
+
+Frontend repo (`Session-Frontend`) was scaffolded separately (Vite + React 19 +
+recharts) with a `HANDOFF.md` contract; `api.py` gained CORS (`frontend_origins()`,
+`FRONTEND_ORIGINS` env) to serve it — that change predates this session's work.
+
+### Comparison framework (10 intents now)
+User's screenshot: "Tatum vs Brown PPG throughout careers" rendered ONE jumbled
+line. Root cause: `get_player_career_trend` is single-entity, so the agent called
+it twice and `_infer_spec` collapsed the concatenated rows to
+`player_career_trend`. Fixed on both sides of the contract:
+- New tools (`nba_tools.py`): `compare_player_career_trends`,
+  `compare_team_histories` (entity×time matrix, rows tagged `PLAYER_NAME` /
+  `TEAM_NAME`), `compare_teams` (team snapshot — closed the gap noted in
+  learning #10). `MAX_COMPARE_ENTITIES = 4`; over-cap → `ToolError` so the
+  agent asks to narrow down. Partial-failure `error` rows preserved per entity.
+- New intents `compare_trends` / `compare_teams` + `VizHint.series_key`
+  (`PLAYER_NAME` / `TEAM_NAME` / `SEASON`, null = legacy single series) and
+  `multi_trend` viz type — all additive, old payloads byte-identical.
+- `_infer_spec`: new tools route to the new intents; the legacy path (two
+  single-entity trend calls) ALSO routes to `compare_trends` with union seasons.
+  `teams` list now collected from `teams` tool args (previously only
+  `team_name`). `_synthesize_answer` covers both new intents.
+- System prompt rules 10–11 (one bulk compare call, never per-entity/per-season
+  loops, max 4 entities) + `comparison=` hint in `_build_user_content` via new
+  `resolver.detect_comparison_intent()`.
+- `choose_viz_hint`: `compare_trends` → `multi_trend` (x=`SEASON`); `compare_teams`
+  → `comparison_bars` (x=`TEAM_NAME`); `compare_players` hint now carries
+  `x_key`/`series_key` for the frontend's generalized bars.
+- `V1_SCOPE_AND_GAPS.txt` updated (10 intents; team-compare gap closed; noted
+  multi-entity last-N-games overlay still has no dedicated tool — frontend
+  pivots it via series detection).
+- Tests: `tests/data_tooling/test_compare_offline.py` (15 tests: caps, fan-out,
+  partial failure, spec routing incl. legacy path, viz hints, synthesis).
+  Full offline suite: 53 passed, 1 skipped (pre-existing skip).
+
+### Groq 413 TPM fix (LeBron vs KD careers: requested 8507 > 8000 limit)
+Two stacked causes: 3 new schemas added per-request tokens, but the real killer
+was the tool-result echo — ~40 career rows × ~30 raw nba_api columns ≈ 21k
+chars (~5.3k tokens) fed back just so the model could write one sentence.
+- New `_slim_tool_content()` in `agent.py`: list rows projected to identity +
+  requested-metric + context (`GP`, team, W/L) keys, capped at 40 rows
+  (`MAX_TOOL_ECHO_ROWS`) keeping the most recent (game logs keep head, trends
+  keep tail), hard-capped at 4000 chars with an omission note. `error` rows pass
+  through; dict (single-row) results echo whole. `QueryResponse.data` is
+  untouched — charts lose nothing.
+- Trimmed verbose tool-schema descriptions (sent on every loop iteration).
+- Measured on a LeBron+KD-shaped payload: echo 21,040 → 4,000 chars
+  (~4.2k tokens saved; request ≈8507 → ≈4200). 5 new tests in
+  `test_agent_offline.py`. Suite: 58 passed, 1 skipped.
+- Learning: with small TPM tiers, the model context is a budget — echo
+  summaries, never raw bulk rows. Charts read `data`, the model only needs
+  answer-sized evidence.
+- Not live-verified (no `GROQ_API_KEY` in this shell); user to retry the query.
+

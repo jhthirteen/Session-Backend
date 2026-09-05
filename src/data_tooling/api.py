@@ -10,15 +10,28 @@ Or run standalone for local testing:
 Contract (React):
     POST /api/nlp/query  {query: "..."}  -> QueryResponse
     GET  /api/nlp/health -> {"status": "ok"}
+
+Cross-repo frontend (Session-Frontend on another port) needs CORS, which
+create_app() enables. Allowed origins come from FRONTEND_ORIGINS
+(comma-separated, default covers Vite + CRA dev servers).
 """
 
-from typing import Optional
+import os
+from typing import List, Optional
 
 from fastapi import APIRouter, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from .agent import run_query
 from .models import QueryResponse
+
+
+def frontend_origins() -> List[str]:
+    raw = os.environ.get(
+        "FRONTEND_ORIGINS", "http://localhost:5173,http://localhost:3000"
+    )
+    return [o.strip() for o in raw.split(",") if o.strip()]
 
 
 class QueryRequest(BaseModel):
@@ -54,6 +67,13 @@ def post_query(body: QueryRequest) -> QueryResponse:
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Session NLP Visualizer")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=frontend_origins(),
+        allow_credentials=True,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Content-Type", "Authorization"],
+    )
     app.include_router(router)
     return app
 

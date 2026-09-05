@@ -41,6 +41,12 @@ tools per season. One bulk call returns the whole history.
 8. Regular season only unless the user says playoffs.
 9. When calling tools, OMIT optional parameters you don't need — never send null. \
 E.g. for full-career questions call get_player_career_trend with just {"player_name": ...}.
+10. For comparisons of MULTIPLE things, use ONE bulk compare call: 'compare X vs Y \
+in <season>' -> compare_players / compare_teams once; 'X vs Y throughout their \
+careers / over time / by year' -> compare_player_career_trends / \
+compare_team_histories once. NEVER call a single-entity trend tool once per \
+entity, and NEVER loop single-season tools per season.
+11. Compare at most 4 entities — if the user names more, STOP and ask which 4 matter most.
 """
 
 
@@ -52,11 +58,13 @@ def _build_user_content(query: str, today: datetime.date) -> str:
     window = resolver.resolve_season_window(query, today)
     trend_hint = resolver.detect_trend_intent(query)
     improvement_hint = resolver.detect_improvement_intent(query)
+    comparison_hint = resolver.detect_comparison_intent(query)
     return (
         f"User query: {query}\n"
         f"[hints] today={today.isoformat()} resolved_season={season_hint} "
         f"metrics={metrics_hint} last_n={last_n_hint} per_mode={per_mode_hint} "
-        f"trend={trend_hint} improvement={improvement_hint} window={window}"
+        f"trend={trend_hint} improvement={improvement_hint} window={window} "
+        f"comparison={comparison_hint}"
     )
 
 
@@ -75,6 +83,70 @@ def _clean_args(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     except (TypeError, ValueError):
         return {k: v for k, v in args.items() if v is not None}
     return {k: v for k, v in args.items() if k in valid and v is not None}
+
+
+# Keys echoed back to the model per tool-result row. The model only needs
+# enough to write its 1-2 sentence answer — full rows live in QueryResponse.data
+# for the frontend. Career/game-log rows carry ~30 nba_api columns each, so
+# echoing them whole blows past small TPM limits (e.g. Groq on-demand 8k).
+_ECHO_IDENTITY_KEYS = (
+    "PLAYER_NAME",
+    "TEAM_NAME",
+    "SEASON",
+    "SEASON_ID",
+    "GAME_DATE",
+    "MATCHUP",
+    "WL",
+)
+_ECHO_CONTEXT_KEYS = ("GP", "TEAM_ABBREVIATION", "W", "L", "W_PCT", "MIN")
+# Max echoed rows per tool call + hard char cap on the echoed JSON.
+MAX_TOOL_ECHO_ROWS = 40
+MAX_TOOL_ECHO_CHARS = 4000
+
+
+def _slim_tool_content(
+    args: Dict[str, Any],
+    result: Any,
+    metrics_hint: List[str],
+) -> str:
+    """Serialize a tool result for the model loop, slimmed to fit TPM limits.
+
+    List rows are projected to identity + requested-metric + context keys and
+    capped at MAX_TOOL_ECHO_ROWS (most recent rows kept). Dict results (single
+    rows) are small and echoed whole. Full data is always preserved in
+    QueryResponse.data — this only affects model context.
+    """
+    if isinstance(result, list):
+        wanted_metrics = args.get("metrics") or metrics_hint or ["PTS"]
+        slimmed: List[Dict[str, Any]] = []
+        for row in result:
+            if not isinstance(row, dict) or row.get("error"):
+                slimmed.append(row)
+                continue
+            slim: Dict[str, Any] = {}
+            for key in _ECHO_IDENTITY_KEYS:
+                if key in row:
+                    slim[key] = row[key]
+            for key in wanted_metrics:
+                if key in row:
+                    slim[key] = row[key]
+            for key in _ECHO_CONTEXT_KEYS:
+                if key in row and key not in slim:
+                    slim[key] = row[key]
+            slimmed.append(slim)
+        note = ""
+        if len(slimmed) > MAX_TOOL_ECHO_ROWS:
+            dropped = len(slimmed) - MAX_TOOL_ECHO_ROWS
+            if any(isinstance(r, dict) and "GAME_DATE" in r for r in slimmed):
+                # Game logs arrive most-recent-first: keep the head.
+                slimmed = slimmed[:MAX_TOOL_ECHO_ROWS]
+                note = f" [{dropped} older games omitted; full data kept for charts]"
+            else:
+                # Trends arrive chronological: keep the most recent tail.
+                slimmed = slimmed[-MAX_TOOL_ECHO_ROWS:]
+                note = f" [{dropped} older rows omitted; full data kept for charts]"
+        return json.dumps(slimmed, default=str)[:MAX_TOOL_ECHO_CHARS] + note
+    return json.dumps(result, default=str)[:MAX_TOOL_ECHO_CHARS]
 
 
 def _peak_row(
@@ -125,15 +197,47 @@ def _synthesize_answer(
                     f"({peak.get(metric)}). Trend covers {span} ({len(data)} seasons)."
                 )
             return f"{metric} trend for {name} covers {span} ({len(data)} seasons)."
-        if intent in ("player_season_avg", "compare_players"):
+        if intent in ("player_season_avg", "compare_players", "compare_teams"):
+            label = "TEAM_NAME" if intent == "compare_teams" else "PLAYER_NAME"
             bits = []
             for r in data:
-                name = r.get("PLAYER_NAME", "Player")
-                pts = r.get("PTS")
-                ast = r.get("AST")
-                extra = f", {ast} AST" if ast is not None else ""
-                bits.append(f"{name} averaged {pts} PPG{extra} ({r.get('SEASON')})")
+                if r.get("error"):
+                    bits.append(
+                        f"{r.get(label, 'Unknown')} unavailable ({r['error']})"
+                    )
+                    continue
+                name = r.get(label, "Unknown")
+                if intent == "compare_teams":
+                    bits.append(
+                        f"{name} finished {r.get('W')}-{r.get('L')} "
+                        f"({r.get('SEASON')})"
+                    )
+                else:
+                    pts = r.get("PTS")
+                    ast = r.get("AST")
+                    extra = f", {ast} AST" if ast is not None else ""
+                    bits.append(f"{name} averaged {pts} PPG{extra} ({r.get('SEASON')})")
             return "; ".join(bits) + "."
+        if intent == "compare_trends":
+            series = sorted(
+                {
+                    str(r.get("PLAYER_NAME") or r.get("TEAM_NAME") or "?")
+                    for r in data
+                    if not r.get("error")
+                }
+            )
+            metric = metrics_hint[0] if metrics_hint else "PTS"
+            seasons = sorted({str(r.get("SEASON")) for r in data if r.get("SEASON")})
+            span = (
+                f"{seasons[0]} to {seasons[-1]}"
+                if len(seasons) > 1
+                else (seasons[0] if seasons else "")
+            )
+            who = " vs ".join(series) if series else "entities"
+            return (
+                f"{metric} trends for {who} cover {span} "
+                f"({len(seasons)} seasons, {len(series)} compared)."
+            )
         if intent in ("player_game_logs", "team_game_logs"):
             first = data[0]
             name = first.get("PLAYER_NAME") or first.get("TEAM_NAME")
@@ -177,6 +281,10 @@ def _infer_spec(
             for p in args["players"]:
                 if p not in players:
                     players.append(p)
+        if isinstance(args.get("teams"), list):
+            for t in args["teams"]:
+                if t not in teams:
+                    teams.append(t)
         if args.get("player_name") and args["player_name"] not in players:
             players.append(args["player_name"])
         if args.get("team_name") and args["team_name"] not in teams:
@@ -184,7 +292,20 @@ def _infer_spec(
         if args.get("last_n"):
             last_n = int(args["last_n"])
 
-    if "get_player_career_trend" in tool_names:
+    if "compare_player_career_trends" in tool_names or "compare_team_histories" in tool_names:
+        intent = "compare_trends"
+        seasons = sorted({str(r.get("SEASON")) for r in data if r.get("SEASON")})
+        season = seasons[-1] if seasons else season
+    elif "get_player_career_trend" in tool_names and len(players) >= 2:
+        # Legacy path: model called the single-entity trend tool per player.
+        # Same shape as compare_player_career_trends output — route it to the
+        # multi-series viz instead of collapsing to one line.
+        intent = "compare_trends"
+        seasons = sorted({str(r.get("SEASON")) for r in data if r.get("SEASON")})
+        season = seasons[-1] if seasons else season
+    elif "compare_teams" in tool_names:
+        intent = "compare_teams"
+    elif "get_player_career_trend" in tool_names:
         intent = "player_career_trend"
         seasons = [str(r.get("SEASON")) for r in data if r.get("SEASON")]
         season = seasons[-1] if seasons else season
@@ -320,7 +441,7 @@ def run_query(
                     traces.append(
                         ToolCallTrace(tool=name, args=args, result_summary=summary)
                     )
-                    content = json.dumps(result, default=str)[:12000]
+                    content = _slim_tool_content(args, result, metrics_hint)
                 except ToolError as e:
                     traces.append(
                         ToolCallTrace(
