@@ -106,6 +106,65 @@ def resolve_season(
     return default
 
 
+_EXPLICIT_SEASON_PHRASES = (
+    "last year",
+    "last season",
+    "past season",
+    "previous season",
+    "this season",
+    "current season",
+    "this year",
+)
+
+
+def has_explicit_season(text: str, today: Optional[datetime.date] = None) -> bool:
+    """True when the query names ONE specific season (not a range/history).
+
+    Matches YYYY-YY, short YY-YY, bare years, and last/this-season phrases.
+    Used by the scope guardrail: explicit season + no trend/comparison words
+    means the LLM must use a single-season tool, never a trend tool.
+    """
+    today = today or datetime.date.today()
+    t = text.lower().strip()
+    if any(p in t for p in _EXPLICIT_SEASON_PHRASES):
+        return True
+    compact = re.sub(r"\s+", "", t)
+    if re.search(r"(\d{4})-(\d{2})", compact):
+        return True
+    if _SHORT_SEASON_RE.search(t):
+        return True
+    m = _YEAR_ONLY_RE.search(t)
+    if m:
+        try:
+            yyyy = int(m.group(1))
+        except ValueError:
+            return False
+        if 2000 <= yyyy <= today.year + 1:
+            return True
+    return False
+
+
+def is_single_season_scope(text: str, today: Optional[datetime.date] = None) -> bool:
+    """True for single-season questions: explicit season, no multi-season signals.
+
+    General across players/teams/metrics — keys off scope vocabulary, not
+    keywords. Trend windows ('last N seasons', 'since YYYY'), trend/improvement/
+    comparison wording, and last-N-games wording all disqualify.
+    """
+    if not has_explicit_season(text, today):
+        return False
+    if detect_trend_intent(text) or detect_improvement_intent(text):
+        return False
+    if detect_comparison_intent(text):
+        return False
+    window = resolve_season_window(text, today)
+    if window.get("last_n_seasons") or window.get("since_season"):
+        return False
+    if _LAST_N_RE.search(text):
+        return False
+    return True
+
+
 def extract_last_n(text: str, default: int = 10) -> int:
     """Extract 'last N games' window; defaults to 10 for game-log intents."""
     m = _LAST_N_RE.search(text)
@@ -148,8 +207,16 @@ _METRIC_SYNONYMS: Dict[str, str] = {
     "field goal percentage": "FG_PCT",
     "fg%": "FG_PCT",
     "field goal": "FG_PCT",
+    "three point percentage": "FG3_PCT",
+    "three-pointer": "FG3M",
+    "three-pointers": "FG3M",
+    "three pointer": "FG3M",
+    "three pointers": "FG3M",
     "three": "FG3M",
     "threes": "FG3M",
+    "3-pointer": "FG3M",
+    "3 pointers": "FG3M",
+    "3pt": "FG3M",
     "3pm": "FG3M",
     "three point percentage": "FG3_PCT",
     "3p%": "FG3_PCT",
@@ -170,15 +237,31 @@ _METRIC_SYNONYMS: Dict[str, str] = {
 
 
 def resolve_metrics(text: str) -> List[str]:
-    """Extract canonical metric keys from free text. Defaults to ['PTS']."""
+    """Extract canonical metric keys from free text. Defaults to ['PTS'].
+
+    Word-boundary matching (not substring): 'point' must not fire inside
+    'pointers' — so 'three pointers' resolves to ['FG3M'], not ['PTS','FG3M'].
+    Longer phrases win and suppress overlapping shorter ones, so
+    'three point percentage' yields FG3_PCT without also yielding FG3M.
+    """
     t = text.lower()
+    # Collect (start, end, key, phrase_len) for every synonym hit.
+    hits: List[Tuple[int, int, str, int]] = []
+    for phrase in _METRIC_SYNONYMS:
+        key = _METRIC_SYNONYMS[phrase]
+        pat = r"(?<!\w)" + re.escape(phrase.lower()) + r"(?!\w)"
+        for m in re.finditer(pat, t):
+            hits.append((m.start(), m.end(), key, len(phrase)))
+    # Longest phrase first so specific multi-word hits claim their span.
+    hits.sort(key=lambda h: -h[3])
     found: List[str] = []
-    # Multi-word phrases first so "field goal percentage" wins over "field goal".
-    for phrase in sorted(_METRIC_SYNONYMS, key=len, reverse=True):
-        if phrase in t:
-            key = _METRIC_SYNONYMS[phrase]
-            if key not in found:
-                found.append(key)
+    claimed: List[Tuple[int, int]] = []
+    for start, end, key, _plen in hits:
+        if any(start < c_end and end > c_start for c_start, c_end in claimed):
+            continue
+        claimed.append((start, end))
+        if key not in found:
+            found.append(key)
     return found or ["PTS"]
 
 
@@ -400,6 +483,17 @@ _SINCE_SEASON_RE = re.compile(
 _TOTALS_RE = re.compile(
     r"\btotals?\b|\bcombined\b|\baltogether\b|\bcumulative\b", re.I
 )
+_PER_GAME_RE = re.compile(
+    r"\baverag\w*\b|\bavg\b|\bper[-\s]?game\b|\bppg\b|\bapg\b|\brpg\b", re.I
+)
+# "How many X did Y make/hit/..." (no average/per-game word) implies season
+# totals, e.g. "How many threes did Curry make in 2023-24". General across
+# metrics — not tied to any one stat or player.
+_TOTALS_VERB_RE = re.compile(
+    r"\bhow many\b.{0,60}\b(made|make|hit|hits|total\w*|recorded|"
+    r"finished with|accumulated|tallied|collected)\b",
+    re.I,
+)
 _COMPARISON_RE = re.compile(
     r"\bcompar(e|ison|ing)\b|\bvs\.?\b|\bversus\b|\bbetween\b"
     r"|\bbetter\b|\bhead.to.head\b|\bhead to head\b|\bwho('s| is) (better|greater)\b",
@@ -423,8 +517,18 @@ def detect_improvement_intent(text: str) -> bool:
 
 
 def resolve_per_mode(text: str) -> str:
-    """'Totals' when the user says totals/combined/altogether, else 'PerGame'."""
-    return "Totals" if _TOTALS_RE.search(text) else "PerGame"
+    """Totals vs PerGame flavor for trend/single-season queries.
+
+    Priority: explicit per-game language (average/per game/ppg/...) wins —
+    so 'how many points did X average' stays PerGame. Otherwise Totals when
+    the user says totals/combined/... or asks 'how many ... made/hit/...'
+    (season-total wording). Defaults to PerGame.
+    """
+    if _PER_GAME_RE.search(text):
+        return "PerGame"
+    if _TOTALS_RE.search(text) or _TOTALS_VERB_RE.search(text):
+        return "Totals"
+    return "PerGame"
 
 
 def resolve_season_window(

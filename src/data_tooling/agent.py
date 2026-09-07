@@ -47,6 +47,12 @@ careers / over time / by year' -> compare_player_career_trends / \
 compare_team_histories once. NEVER call a single-entity trend tool once per \
 entity, and NEVER loop single-season tools per season.
 11. Compare at most 4 entities — if the user names more, STOP and ask which 4 matter most.
+12. Scope rule (most important): an explicit single season ('in 2023-24', \
+'last season', '2024-25') with NO multi-season words (career/history/over time/\
+year by year/every season/best season/most improved/last N seasons/since/compare) \
+means ONE season only — call get_player_season_averages / get_team_stats / \
+compare_players / compare_teams, NEVER a career/history trend tool. Trend tools \
+are ONLY for questions that ask about multiple seasons, careers, or history.
 """
 
 
@@ -337,6 +343,30 @@ def _infer_spec(
         intent = "needs_clarification"
     else:
         intent = "player_season_avg"
+
+    # Scope guardrail (deterministic safety net behind prompt rule 12): the LLM
+    # sometimes calls a trend tool for an explicit single-season question
+    # ("How many threes did Curry make in 2023-24"). When the query is
+    # single-season scope but a trend tool ran, slice to that season and
+    # downgrade to the snapshot intent — so viz_hint becomes single_stat /
+    # team_stat_card instead of a 17-season trend_line. No-op when the season
+    # row is absent (never fabricate) or the query genuinely wants history.
+    if intent in ("player_career_trend", "team_history_trend"):
+        if resolver.is_single_season_scope(query):
+            # Slice to the query's explicit season (not seasons[-1], which the
+            # trend branch above overwrote to the latest data row).
+            explicit = resolver.resolve_season(query)
+            target = explicit or season
+            scoped = [r for r in data if str(r.get("SEASON")) == target] if target else []
+            if scoped:
+                data[:] = scoped
+                season = target
+                seasons = [target] if target else []
+                highlight_season, highlight_note = None, None
+                if intent == "player_career_trend" and len(players) == 1:
+                    intent = "player_season_avg"
+                elif intent == "team_history_trend" and len(teams) == 1:
+                    intent = "team_stats"
 
     return QuerySpec(
         intent=intent,  # type: ignore[arg-type]

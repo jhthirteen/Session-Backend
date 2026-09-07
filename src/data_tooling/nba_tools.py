@@ -705,8 +705,10 @@ GROQ_TOOL_SCHEMAS: List[Dict[str, Any]] = [
                 "name": "get_player_career_trend",
                 "description": (
                     "Season-by-season history for ONE player in a SINGLE call. "
-                    "Use for any career/multi-season question; never loop "
-                    "single-season tools per season."
+                    "ONLY for questions about multiple seasons / career / history "
+                    "(e.g. 'year by year', 'best season ever', 'throughout his "
+                    "career'). NEVER for a single explicit season like "
+                    "'in 2023-24' — use get_player_season_averages for that."
                 ),
             "parameters": {
                 "type": "object",
@@ -736,7 +738,9 @@ GROQ_TOOL_SCHEMAS: List[Dict[str, Any]] = [
                 "name": "get_team_history_trend",
                 "description": (
                     "Year-by-year history for ONE team in a SINGLE call. "
-                    "Use for multi-season team questions; never loop get_team_stats."
+                    "ONLY for multi-season / history questions. NEVER for a "
+                    "single explicit season like 'last season' — use "
+                    "get_team_stats for that."
                 ),
             "parameters": {
                 "type": "object",
