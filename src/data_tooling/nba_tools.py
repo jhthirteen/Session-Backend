@@ -402,6 +402,77 @@ def compare_team_histories(
     return rows
 
 
+# Stat categories the LeagueLeaders endpoint can rank by (subset we expose —
+# must be real LeagueLeaders columns, verified live 2026-09-07).
+LEADER_STAT_CATEGORIES = (
+    "PTS", "AST", "REB", "STL", "BLK", "MIN",
+    "FGM", "FGA", "FG_PCT", "FG3M", "FG3A", "FG3_PCT",
+    "FTM", "FTA", "FT_PCT", "OREB", "DREB", "TOV", "EFF",
+)
+
+# Max leaderboard rows per call — keeps charts readable; more → ToolError so
+# the agent asks to narrow down (mirrors MAX_COMPARE_ENTITIES).
+MAX_LEADERBOARD_ROWS = 25
+
+
+def get_league_leaders(
+    stat_category: str,
+    season: str,
+    top_n: int = 10,
+    per_mode: str = "PerGame",
+) -> List[Dict[str, Any]]:
+    """League-wide ranking for one stat + season in ONE API call.
+
+    Powers 'who led the NBA in assists', 'top 10 scorers' — any
+    ranked-players × one-stat × one-season × top-N question. Rows arrive
+    RANK-sorted; each carries PLAYER_NAME / TEAM_ABBREVIATION / RANK / GP /
+    the ranked stat. per_mode 'PerGame' matches title convention (PPG/APG);
+    pass 'Totals' only when the user asks for cumulative totals.
+    """
+    stat_category = (stat_category or "PTS").upper()
+    if stat_category not in LEADER_STAT_CATEGORIES:
+        raise ToolError(
+            f"Can't rank by '{stat_category}'. "
+            f"Try one of: {', '.join(LEADER_STAT_CATEGORIES)}."
+        )
+    if per_mode not in ("PerGame", "Totals"):
+        raise ToolError(f"per_mode must be 'PerGame' or 'Totals', got '{per_mode}'.")
+    try:
+        top_n = max(1, min(int(top_n or 10), MAX_LEADERBOARD_ROWS))
+    except (TypeError, ValueError):
+        raise ToolError(f"top_n must be 1-{MAX_LEADERBOARD_ROWS}, got '{top_n}'.")
+    key = _cache_key("get_league_leaders", {
+        "c": stat_category, "s": season, "n": top_n, "m": per_mode,
+    })
+    hit = _cache_get(key)
+    if hit is not None:
+        return hit
+
+    from nba_api.stats.endpoints import leagueleaders  # type: ignore
+
+    obj = _call_with_retry(
+        lambda: leagueleaders.LeagueLeaders(
+            season=season,
+            stat_category_abbreviation=stat_category,
+            per_mode48=per_mode,
+            season_type_all_star="Regular Season",
+            timeout=30,
+        )
+    )
+    df = obj.get_data_frames()[0]
+    if df.empty:
+        raise ToolError(f"No league leaders for {stat_category} in season {season}.")
+    df = df.sort_values("RANK").head(top_n)
+    rows = [_normalize_row(r) for r in df.to_dict(orient="records")]
+    for r in rows:
+        r["PLAYER_NAME"] = r.pop("PLAYER", "Unknown")
+        r["TEAM_ABBREVIATION"] = r.pop("TEAM", None)
+        r["SEASON"] = season
+        r["PER_MODE"] = per_mode
+    _cache_set(key, rows)
+    return rows
+
+
 def _normalize_row(record: Dict[str, Any]) -> Dict[str, Any]:
     return {k: (v.item() if hasattr(v, "item") else v) for k, v in record.items()}
 
@@ -538,6 +609,7 @@ TOOL_FUNCS: Dict[str, Callable[..., Any]] = {
     "compare_team_histories": compare_team_histories,
     "get_player_career_trend": get_player_career_trend,
     "get_team_history_trend": get_team_history_trend,
+    "get_league_leaders": get_league_leaders,
 }
 
 GROQ_TOOL_SCHEMAS: List[Dict[str, Any]] = [
@@ -756,6 +828,39 @@ GROQ_TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     },
                 },
                 "required": ["team_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+                "name": "get_league_leaders",
+                "description": (
+                    "League-wide ranking for ONE stat and season in a SINGLE call. "
+                    "ONLY for league-leader questions ('who led the NBA in assists', "
+                    "'top 10 scorers in 2024-25', 'most threes'). NEVER fan out "
+                    "per-player calls for rankings, and NEVER use for single-player "
+                    "or single-team questions."
+                ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "stat_category": {
+                        "type": "string",
+                        "description": "Stat to rank by, e.g. 'PTS' for scorers, 'AST' for assists, 'REB', 'STL', 'BLK', 'FG3M'.",
+                    },
+                    "season": {"type": "string", "description": "'YYYY-YY'"},
+                    "top_n": {
+                        "type": ["integer", "null"],
+                        "description": "Rows to return, 1-25. 'Who led' -> 5, 'top 10' -> 10. Omit for default 10.",
+                    },
+                    "per_mode": {
+                        "type": ["string", "null"],
+                        "enum": ["PerGame", "Totals", None],
+                        "description": "Per-game (default, title convention) or Totals. Omit if unsure.",
+                    },
+                },
+                "required": ["stat_category", "season"],
             },
         },
     },

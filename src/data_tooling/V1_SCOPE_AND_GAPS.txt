@@ -3,10 +3,10 @@ NLP Visualizer V1 — Scope and Known Gaps
 (Checkpoint 3 status; generated 2026-09-05. Do not treat this file as a roadmap
 commitment — it is a snapshot of what the toolbelt can and cannot do today.)
 
-HANDLED (10 intents + clarification) — updated 2026-09-06: comparisons built
+HANDLED (11 intents + clarification) — updated 2026-09-07: league leaders built
 --------------------------------------------------------------------------------
 1. player_season_avg   — one player, one season, per-game averages
-                         (PlayerCareerStats, PerMode=PerGame)
+                          (PlayerCareerStats, PerMode=PerGame)
 2. player_game_logs    — one player, last-N games (PlayerGameLog, default N=10)
 3. team_stats          — one team, one season W/L record (TeamYearByYearStats)
 4. team_game_logs      — one team, last-N games (TeamGameLog, default N=10)
@@ -28,10 +28,15 @@ HANDLED (10 intents + clarification) — updated 2026-09-06: comparisons built
 9. team_history_trend  — year-by-year history, ONE TeamYearByYearStats call
                          (windows; W/L aliases; unified SEASON key; trend_line)
 10. needs_clarification — ambiguous/unknown names, unresolvable seasons,
-                         non-statistical queries. Never guesses.
+                          non-statistical queries. Never guesses.
+11. league_leaders     — ranked players × one stat × one season × top N in ONE
+                          LeagueLeaders call ('who led the NBA in assists',
+                          'top 10 scorers'; viz leaderboard with series_key;
+                          PerGame default per title convention, Totals on
+                          request; top_n 1-25, default 5 for bare 'led').
 
-The Groq agent (agent.py) has exactly these 5 tools (nba_tools.py:TOOL_FUNCS).
-It cannot fetch anything else; it can only phrase these 5 in different words.
+The Groq agent (agent.py) has exactly these 11 tools (nba_tools.py:TOOL_FUNCS).
+It cannot fetch anything else; it can only phrase these 11 in different words.
 
 OUT OF SCOPE (will clarify or answer awkwardly)
 ----------------------------------------------

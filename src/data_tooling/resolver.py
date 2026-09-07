@@ -186,6 +186,9 @@ _METRIC_SYNONYMS: Dict[str, str] = {
     "points": "PTS",
     "ppg": "PTS",
     "scored": "PTS",
+    "scorer": "PTS",
+    "scorers": "PTS",
+    "scoring": "PTS",
     # assists
     "assist": "AST",
     "assists": "AST",
@@ -499,11 +502,43 @@ _COMPARISON_RE = re.compile(
     r"|\bbetter\b|\bhead.to.head\b|\bhead to head\b|\bwho('s| is) (better|greater)\b",
     re.I,
 )
+# League-leader questions: "who led the NBA in assists", "top 10 scorers",
+# "league leaders", "scoring title". High precision by design — "most <stat>"
+# phrasing is left to the LLM (prompt rule 13) since it overlaps peak wording.
+_LEADERS_RE = re.compile(
+    r"\b(led|leads|leading|leaders?)\b.{0,30}\b(nba|league)\b"
+    r"|\b(nba|league)\b.{0,30}\bleaders?\b"
+    r"|\bscoring (title|race|crown)\b",
+    re.I,
+)
+_TOP_N_RE = re.compile(r"\btop\s+(\d{1,2})\b", re.I)
+
+#: Default leaderboard depth for bare "who led" questions (leader + context).
+DEFAULT_LEADERS_TOP_N = 5
 
 
 def detect_comparison_intent(text: str) -> bool:
     """True when the query compares multiple things (entities, seasons, games)."""
     return bool(_COMPARISON_RE.search(text))
+
+
+def detect_leaders_intent(text: str) -> bool:
+    """True for league-leader questions (ranked players, one stat, one season)."""
+    if _LEADERS_RE.search(text):
+        return True
+    # "top 10 scorers" without led/league words is still a ranking question.
+    return bool(_TOP_N_RE.search(text))
+
+
+def extract_top_n(text: str, default: int = DEFAULT_LEADERS_TOP_N) -> int:
+    """Extract 'top N' depth; defaults to DEFAULT_LEADERS_TOP_N for bare 'led'."""
+    m = _TOP_N_RE.search(text)
+    if m:
+        try:
+            return max(1, min(int(m.group(1)), 25))
+        except ValueError:
+            return default
+    return default
 
 
 def detect_trend_intent(text: str) -> bool:
@@ -623,6 +658,17 @@ def choose_viz_hint(spec: QuerySpec) -> VizHint:
     season = spec.season or ""
     metrics = spec.metrics or ["PTS"]
 
+    if spec.intent == "league_leaders":
+        flavor = "totals" if getattr(spec, "per_mode", "PerGame") == "Totals" else "per game"
+        depth = getattr(spec, "top_n", None) or len(getattr(spec, "players", None) or []) or ""
+        title = f"{season} NBA {'/'.join(metrics)} leaders ({flavor}, top {depth})".strip()
+        return VizHint(
+            type="leaderboard",
+            title=title,
+            x_key="PLAYER_NAME",
+            y_keys=metrics,
+            series_key="PLAYER_NAME",
+        )
     if spec.intent in ("player_career_trend", "team_history_trend"):
         flavor = "totals" if getattr(spec, "per_mode", "PerGame") == "Totals" else "per game"
         window = ""

@@ -24,6 +24,7 @@ Intent = Literal[
     "compare_trends",
     "player_career_trend",
     "team_history_trend",
+    "league_leaders",
     "needs_clarification",
 ]
 
@@ -35,6 +36,7 @@ VizType = Literal[
     "team_stat_card",  # team record + ratings card
     "trend_line",  # season-by-season line chart (x=SEASON, chartable per-game or totals)
     "multi_trend",  # 2+ entities over time — one line per series_key value
+    "leaderboard",  # ranked players for one stat + season (x=PLAYER_NAME, RANK-sorted)
 ]
 
 # Canonical metric keys (match nba_api column names where possible).
@@ -77,6 +79,11 @@ class QuerySpec(BaseModel):
     last_n: Optional[int] = Field(
         default=None,
         description="For game-log queries: how many recent games (default 10).",
+    )
+    top_n: Optional[int] = Field(
+        default=None,
+        description="For league-leader queries: leaderboard depth (default 5 for "
+        "'who led', explicit N for 'top N').",
     )
     per_mode: Literal["PerGame", "Totals"] = Field(
         default="PerGame",

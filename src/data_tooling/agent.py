@@ -53,6 +53,11 @@ year by year/every season/best season/most improved/last N seasons/since/compare
 means ONE season only — call get_player_season_averages / get_team_stats / \
 compare_players / compare_teams, NEVER a career/history trend tool. Trend tools \
 are ONLY for questions that ask about multiple seasons, careers, or history.
+13. League-leader questions ('who led the NBA in assists', 'top 10 scorers', \
+'most threes', 'scoring title' — ranked players, one stat, one season, no \
+named player) -> call get_league_leaders ONCE with stat_category + season + \
+top_n ('who led' -> 5, 'top N' -> N). NEVER fan out per-player calls for a \
+ranking, and NEVER use a trend/history tool for it.
 """
 
 
@@ -65,12 +70,14 @@ def _build_user_content(query: str, today: datetime.date) -> str:
     trend_hint = resolver.detect_trend_intent(query)
     improvement_hint = resolver.detect_improvement_intent(query)
     comparison_hint = resolver.detect_comparison_intent(query)
+    leaders_hint = resolver.detect_leaders_intent(query)
+    top_n_hint = resolver.extract_top_n(query)
     return (
         f"User query: {query}\n"
         f"[hints] today={today.isoformat()} resolved_season={season_hint} "
         f"metrics={metrics_hint} last_n={last_n_hint} per_mode={per_mode_hint} "
         f"trend={trend_hint} improvement={improvement_hint} window={window} "
-        f"comparison={comparison_hint}"
+        f"comparison={comparison_hint} leaders={leaders_hint} top_n={top_n_hint}"
     )
 
 
@@ -186,6 +193,18 @@ def _synthesize_answer(
         return "I couldn't find stats for that query — try a different player, team, or season."
     metrics_hint = metrics_hint or ["PTS"]
     try:
+        if intent == "league_leaders":
+            metric = metrics_hint[0] if metrics_hint else "PTS"
+            ranked = sorted(data, key=lambda r: r.get("RANK") or 999)
+            top = ranked[0]
+            name = top.get("PLAYER_NAME", "Unknown")
+            val = top.get(metric)
+            season = top.get("SEASON", "")
+            unit = "per game" if top.get("PER_MODE", "PerGame") == "PerGame" else "total"
+            return (
+                f"{name} led the NBA in {metric} ({val} {unit}) in {season} "
+                f"— top {len(ranked)} shown."
+            )
         if intent in ("player_career_trend", "team_history_trend"):
             metric = metrics_hint[0] if metrics_hint else "PTS"
             name = data[0].get("PLAYER_NAME") or data[0].get("TEAM_NAME") or "Team"
@@ -273,6 +292,7 @@ def _infer_spec(
     teams: List[str] = []
     season: Optional[str] = season_hint
     last_n: Optional[int] = None
+    top_n: Optional[int] = None
     per_mode: str = per_mode_hint
     seasons: List[str] = []
     highlight_season: Optional[str] = None
@@ -297,6 +317,8 @@ def _infer_spec(
             teams.append(args["team_name"])
         if args.get("last_n"):
             last_n = int(args["last_n"])
+        if args.get("top_n"):
+            top_n = max(1, min(int(args["top_n"]), 25))
 
     if "compare_player_career_trends" in tool_names or "compare_team_histories" in tool_names:
         intent = "compare_trends"
@@ -311,6 +333,19 @@ def _infer_spec(
         season = seasons[-1] if seasons else season
     elif "compare_teams" in tool_names:
         intent = "compare_teams"
+    elif "get_league_leaders" in tool_names:
+        intent = "league_leaders"
+        # Leaderboard rows carry canonical names — collect them for the spec
+        # (the query itself names no players).
+        for r in data:
+            name = r.get("PLAYER_NAME")
+            if name and name not in players:
+                players.append(str(name))
+        top_n = top_n or resolver.extract_top_n(query)
+        if args_season := next(
+            (a.get("season") for a in tool_args if a.get("season")), None
+        ):
+            season = args_season
     elif "get_player_career_trend" in tool_names:
         intent = "player_career_trend"
         seasons = [str(r.get("SEASON")) for r in data if r.get("SEASON")]
@@ -375,6 +410,7 @@ def _infer_spec(
         season=season,
         metrics=metrics_hint or ["PTS"],  # type: ignore[arg-type]
         last_n=last_n,
+        top_n=top_n,
         per_mode=per_mode,  # type: ignore[arg-type]
         seasons=seasons,
         highlight_season=highlight_season,
