@@ -473,6 +473,95 @@ def get_league_leaders(
     return rows
 
 
+# Team-leader stat specs: key -> (dash measure, column, ascending?).
+# Verified live 2026-09-07 (Base/Opponent/Advanced LeagueDashTeamStats).
+# Defense sorts ascending (fewest allowed wins); everything else descending.
+TEAM_LEADER_SPECS: Dict[str, Any] = {
+    "W": ("Base", "W", False),
+    "W_PCT": ("Base", "W_PCT", False),
+    "PTS": ("Base", "PTS", False),
+    "FG3M": ("Base", "FG3M", False),
+    "FG_PCT": ("Base", "FG_PCT", False),
+    "FT_PCT": ("Base", "FT_PCT", False),
+    "REB": ("Base", "REB", False),
+    "AST": ("Base", "AST", False),
+    "STL": ("Base", "STL", False),
+    "BLK": ("Base", "BLK", False),
+    "PLUS_MINUS": ("Base", "PLUS_MINUS", False),
+    "OPP_PTS": ("Opponent", "OPP_PTS", True),
+    "OFF_RATING": ("Advanced", "OFF_RATING", False),
+    "DEF_RATING": ("Advanced", "DEF_RATING", True),
+    "NET_RATING": ("Advanced", "NET_RATING", False),
+}
+
+
+def get_team_leaders(
+    stat: str,
+    season: str,
+    top_n: int = 10,
+    per_mode: str = "PerGame",
+) -> List[Dict[str, Any]]:
+    """League-wide TEAM ranking for one stat + season in ONE API call.
+
+    Powers 'which team won the most games', 'best offense/defense',
+    'best net rating', 'most threes by a team' — any ranked-teams × one-stat
+    × one-season × top-N question. One LeagueDashTeamStats call returns all 30
+    teams; rows are directionally sorted (ascending only for defense-style
+    stats like OPP_PTS/DEF_RATING) and RANK-assigned client-side.
+    """
+    stat = (stat or "W").upper()
+    spec = TEAM_LEADER_SPECS.get(stat)
+    if spec is None:
+        raise ToolError(
+            f"Can't rank teams by '{stat}'. "
+            f"Try one of: {', '.join(sorted(TEAM_LEADER_SPECS))}."
+        )
+    measure, column, ascending = spec
+    if per_mode not in ("PerGame", "Totals"):
+        raise ToolError(f"per_mode must be 'PerGame' or 'Totals', got '{per_mode}'.")
+    try:
+        top_n = max(1, min(int(top_n or 10), MAX_LEADERBOARD_ROWS))
+    except (TypeError, ValueError):
+        raise ToolError(f"top_n must be 1-{MAX_LEADERBOARD_ROWS}, got '{top_n}'.")
+    key = _cache_key("get_team_leaders", {
+        "c": stat, "s": season, "n": top_n, "m": per_mode,
+    })
+    hit = _cache_get(key)
+    if hit is not None:
+        return hit
+
+    from nba_api.stats.endpoints import leaguedashteamstats  # type: ignore
+
+    obj = _call_with_retry(
+        lambda: leaguedashteamstats.LeagueDashTeamStats(
+            season=season,
+            season_type_all_star="Regular Season",
+            measure_type_detailed_defense=measure,
+            per_mode_detailed=per_mode,
+            timeout=30,
+        )
+    )
+    df = obj.get_data_frames()[0]
+    if df.empty or column not in df.columns:
+        raise ToolError(f"No team leaders for {stat} in season {season}.")
+    df = df.sort_values(column, ascending=ascending).head(top_n)
+    rows = [_normalize_row(r) for r in df.to_dict(orient="records")]
+    out: List[Dict[str, Any]] = []
+    for i, r in enumerate(rows, start=1):
+        out.append({
+            "RANK": i,
+            "TEAM_NAME": r.get("TEAM_NAME", "Unknown"),
+            "SEASON": season,
+            "GP": r.get("GP"),
+            "W": r.get("W"),
+            "L": r.get("L"),
+            stat: r.get(column),
+            "PER_MODE": per_mode,
+        })
+    _cache_set(key, out)
+    return out
+
+
 def _normalize_row(record: Dict[str, Any]) -> Dict[str, Any]:
     return {k: (v.item() if hasattr(v, "item") else v) for k, v in record.items()}
 
@@ -610,6 +699,7 @@ TOOL_FUNCS: Dict[str, Callable[..., Any]] = {
     "get_player_career_trend": get_player_career_trend,
     "get_team_history_trend": get_team_history_trend,
     "get_league_leaders": get_league_leaders,
+    "get_team_leaders": get_team_leaders,
 }
 
 GROQ_TOOL_SCHEMAS: List[Dict[str, Any]] = [
@@ -861,6 +951,39 @@ GROQ_TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     },
                 },
                 "required": ["stat_category", "season"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+                "name": "get_team_leaders",
+                "description": (
+                    "League-wide TEAM ranking for ONE stat and season in a SINGLE call. "
+                    "ONLY for team-leader questions ('which team won the most games', "
+                    "'best offense/defense', 'best net rating', 'top 10 offenses'). "
+                    "NEVER fan out per-team get_team_stats calls for a ranking, and "
+                    "NEVER use for single-team or player questions."
+                ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "stat": {
+                        "type": "string",
+                        "description": "Team stat to rank by: 'W' (wins/record), 'PTS' (offense), 'OPP_PTS' (defense, fewest allowed), 'NET_RATING', 'OFF_RATING', 'DEF_RATING', 'FG3M', 'FG_PCT'.",
+                    },
+                    "season": {"type": "string", "description": "'YYYY-YY'"},
+                    "top_n": {
+                        "type": ["integer", "null"],
+                        "description": "Rows to return, 1-25. 'Which team led' -> 5, 'top 10' -> 10. Omit for default 10.",
+                    },
+                    "per_mode": {
+                        "type": ["string", "null"],
+                        "enum": ["PerGame", "Totals", None],
+                        "description": "Per-game (default) or Totals. Omit if unsure.",
+                    },
+                },
+                "required": ["stat", "season"],
             },
         },
     },

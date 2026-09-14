@@ -202,3 +202,89 @@ chars (~5.3k tokens) fed back just so the model could write one sentence.
   answer-sized evidence.
 - Not live-verified (no `GROQ_API_KEY` in this shell); user to retry the query.
 
+
+---
+
+## Continued session 2026-09-07 — viz robustness + leaders + team stats (backend half)
+
+All work on branch `feature/the_answer` (note: `vizualization_cleanup` was
+merged into it via PR #6 early in the session).
+
+### Viz-selection robustness (Curry 3PM screenshot: career trend for a single season)
+- `resolve_metrics()` was substring matching: `"point" in "three pointers"` →
+  `["PTS","FG3M"]`. Now word-boundary matching with overlap suppression
+  (longest phrase claims its span): `three pointers → [FG3M]`,
+  `three point percentage → [FG3_PCT]` only. Added hyphen/space `3pt` variants.
+- `resolve_per_mode()` was Totals-only on `totals/combined/...`. Now verb-aware:
+  per-game language (average/per game/ppg) wins; `how many ... made/hit/...`
+  → Totals. Curry query → Totals, Brunson-average → PerGame.
+- Prompt rule 12 (explicit single season + no trend words → single-season tool,
+  never trend) + tightened trend-tool descriptions.
+- Deterministic guardrail in `_infer_spec`: trend tool + `is_single_season_scope()`
+  (new `has_explicit_season()`) → slice data to the query season, downgrade to
+  `player_season_avg`/`team_stats`. Passes through when the season row is absent
+  (never fabricate). Caught own off-by-one in testing (sliced to `seasons[-1]`
+  instead of `resolve_season(query)`).
+- New `tests/data_tooling/test_scope_guardrail.py` (13 tests).
+
+### League leaders (new intent #11: `league_leaders`, viz `leaderboard`)
+- New tool `get_league_leaders(stat_category, season, top_n, per_mode)` — one
+  `LeagueLeaders` call, RANK-sorted rows (`PLAYER_NAME/TEAM_ABBREVIATION/RANK/GP`
+  + stat), top_n clamped 1–25 (`MAX_LEADERBOARD_ROWS`). PerGame default per
+  title convention. Live-verified: 2024-25 AST Trae 11.6 → Harden 8.7 (top 5);
+  PTS SGA 32.7 → Lillard 24.9 (top 10).
+- Resolver: `detect_leaders_intent()` (led/leaders/top-N/scoring-title; "most"
+  deliberately left to the LLM — overlaps peak wording), `extract_top_n()`
+  (default 5 for bare "led"), `scorer/scorers/scoring → PTS`.
+- Contract (additive): `Intent += league_leaders`, `VizType += leaderboard`,
+  `QuerySpec.top_n`. Agent rule 13 + `leaders=`/`top_n=` hints + routing +
+  synthesis ("Trae Young led the NBA in AST (11.6 per game) ...").
+- New `tests/data_tooling/test_leaders_offline.py` (15 tests).
+
+### Team leaders (new intent #12: `team_leaders`, shared `leaderboard` viz)
+- New tool `get_team_leaders(stat, season, top_n, per_mode)` — one
+  `LeagueDashTeamStats` call for all 30 teams (fan-out of 30× get_team_stats
+  rejected as slow/rate-hostile). Stat→(measure, column, direction) table:
+  Base (W/PTS/FG3M/...), Opponent (`OPP_PTS` ascending — best defense),
+  Advanced (`OFF/DEF/NET_RATING`, columns verified live before coding).
+  Live-verified 2024-25: wins OKC 68, offense Cavs 121.9, defense ORL 105.5
+  (plan guessed OKC — wrong, good thing we check), net OKC +12.7.
+- Resolver: separate team vocab table (`best record/most wins → W`,
+  `offense → PTS`, `defense → OPP_PTS`, ratings), `detect_team_leaders_intent()`
+  requires ranking words + team nouns AND vetoes any specific-team alias mention
+  ("celtics record" stays `team_stats` — precision over recall).
+- Reuses `leaderboard` viz with `x_key=TEAM_NAME`; `MetricKey += PLUS_MINUS,
+  OPP_PTS, OFF/DEF/NET_RATING` (first test run caught the Literal gap).
+  Agent rule 14 + `team_leaders=`/`team_stat=` hints + routing (metrics from
+  tool `stat` arg — player map has no defense/ratings words).
+- New `tests/data_tooling/test_team_leaders_offline.py` (19 tests).
+- `V1_SCOPE_AND_GAPS.txt` updated (12 intents; fixed stale "5 tools" line).
+
+### Team single-stat generality (GSW 1264-threes query)
+- Diagnosis: data + hints were correct; gaps were downstream — team_stats
+  synthesis hardcoded W-L phrasing, viz always chose the record card, frontend
+  StatCard assumed player rows.
+- New `explicit_metrics()` (named stats vs PTS default) + `RECORD_METRICS`:
+  team_stats + explicit non-record stat → `single_stat`, else record card
+  (vague "how did the celtics do" still cards). Synthesis leads with named
+  stats ("recorded 1,264 FG3M"), record phrasing preserved otherwise.
+- New `tests/data_tooling/test_team_stats_general.py` (11 tests).
+
+### Leaders guardrails (GSW leaderboard screenshot: wrong intent + doubled rows)
+- Screenshot showed `team_leaders` top-10 for one named team AND PerGame+Totals
+  row sets concatenated (Boston 17.8 + 1,457 in one chart) — LLM double-call.
+- `_infer_spec` leaders guardrails (players + teams): unify mixed PER_MODE row
+  sets to one mode; single-entity misfire (exactly one data name mentioned,
+  no ranking intent) → slice + downgrade to `player_season_avg`/`team_stats`.
+- Overfit caught by audit: "Did the Warriors make the MOST threes" was wrongly
+  downgraded (ranking context IS the answer). Added `has_ranking_language()`
+  gate (most/best/top/led...; excludes "last" and "win/won"). 5-scenario matrix
+  verified: plain single-entity → card; ranking-flavored → board kept.
+- Prompt rules 13/14 gained NEVER clauses with the exact failing examples.
+- New `find_named_entities()` (full name or last token, word-boundary,
+  data-driven — no hardcoded names).
+
+### Suite status
+- Offline: 126 passed, 13 skipped (skips are live/gated). No GROQ_API_KEY in
+  this shell — LLM end-to-end (tool choice for leaders/team-stat queries) left
+  for the user's keyed shell throughout.

@@ -54,10 +54,21 @@ means ONE season only — call get_player_season_averages / get_team_stats / \
 compare_players / compare_teams, NEVER a career/history trend tool. Trend tools \
 are ONLY for questions that ask about multiple seasons, careers, or history.
 13. League-leader questions ('who led the NBA in assists', 'top 10 scorers', \
-'most threes', 'scoring title' — ranked players, one stat, one season, no \
+'most threes', 'scoring title' — ranked players, one stat, one season, NO \
 named player) -> call get_league_leaders ONCE with stat_category + season + \
 top_n ('who led' -> 5, 'top N' -> N). NEVER fan out per-player calls for a \
-ranking, and NEVER use a trend/history tool for it.
+ranking, NEVER use a trend/history tool for it, and NEVER use it when the \
+query names ONE specific player ('how many points did Brunson average' -> \
+get_player_season_averages, even though it says 'how many').
+14. Team-leader questions ('which team won the most games', 'best offense / \
+defense / net rating', 'top 10 offenses' — ranked TEAMS, one stat, one season, \
+NO named team) -> call get_team_leaders ONCE with stat + season + top_n. \
+Stat map: wins/record -> 'W', offense -> 'PTS', defense/fewest allowed -> \
+'OPP_PTS', net rating -> 'NET_RATING', offensive/defensive rating -> \
+'OFF_RATING'/'DEF_RATING'. NEVER fan out per-team get_team_stats calls for a \
+ranking, NEVER use the player-leaders tool for team questions, and NEVER use \
+it when the query names ONE specific team ('how many threes did GSW make' -> \
+get_team_stats, even though it says 'how many').
 """
 
 
@@ -72,12 +83,15 @@ def _build_user_content(query: str, today: datetime.date) -> str:
     comparison_hint = resolver.detect_comparison_intent(query)
     leaders_hint = resolver.detect_leaders_intent(query)
     top_n_hint = resolver.extract_top_n(query)
+    team_stat_hint = resolver.resolve_team_leader_stat(query)
+    team_leaders_hint = resolver.detect_team_leaders_intent(query)
     return (
         f"User query: {query}\n"
         f"[hints] today={today.isoformat()} resolved_season={season_hint} "
         f"metrics={metrics_hint} last_n={last_n_hint} per_mode={per_mode_hint} "
         f"trend={trend_hint} improvement={improvement_hint} window={window} "
-        f"comparison={comparison_hint} leaders={leaders_hint} top_n={top_n_hint}"
+        f"comparison={comparison_hint} leaders={leaders_hint} top_n={top_n_hint} "
+        f"team_leaders={team_leaders_hint} team_stat={team_stat_hint}"
     )
 
 
@@ -205,6 +219,17 @@ def _synthesize_answer(
                 f"{name} led the NBA in {metric} ({val} {unit}) in {season} "
                 f"— top {len(ranked)} shown."
             )
+        if intent == "team_leaders":
+            metric = metrics_hint[0] if metrics_hint else "W"
+            ranked = sorted(data, key=lambda r: r.get("RANK") or 999)
+            top = ranked[0]
+            name = top.get("TEAM_NAME", "Unknown")
+            val = top.get(metric)
+            season = top.get("SEASON", "")
+            return (
+                f"{name} led the NBA in team {metric} ({val}) in {season} "
+                f"— top {len(ranked)} shown."
+            )
         if intent in ("player_career_trend", "team_history_trend"):
             metric = metrics_hint[0] if metrics_hint else "PTS"
             name = data[0].get("PLAYER_NAME") or data[0].get("TEAM_NAME") or "Team"
@@ -269,9 +294,29 @@ def _synthesize_answer(
             return f"Showing the latest {len(data)} games for {name} ({first.get('SEASON_ID', '')})."
         if intent == "team_stats":
             r = data[0]
+            name = r.get("TEAM_NAME", "Unknown")
+            season = r.get("SEASON", "")
+            # Any explicitly-named non-record stat leads ("... made 1,264
+            # FG3M ..."); record questions keep the W-L phrasing. General
+            # across stats — driven by the query's own vocabulary.
+            explicit = resolver.explicit_metrics(query)
+            stats = [m for m in explicit if m not in resolver.RECORD_METRICS]
+            if stats:
+                bits = []
+                for m in stats:
+                    v = r.get(m)
+                    if v is None:
+                        continue
+                    try:
+                        shown = f"{int(v):,}"
+                    except (TypeError, ValueError):
+                        shown = str(v)
+                    bits.append(f"{shown} {m}")
+                if bits:
+                    return f"{name} recorded {' and '.join(bits)} in {season}."
             return (
-                f"{r.get('TEAM_NAME')} finished {r.get('W')}-{r.get('L')} "
-                f"({r.get('W_PCT')}) in {r.get('SEASON')}."
+                f"{name} finished {r.get('W')}-{r.get('L')} "
+                f"({r.get('W_PCT')}) in {season}."
             )
     except Exception:
         pass
@@ -346,6 +391,24 @@ def _infer_spec(
             (a.get("season") for a in tool_args if a.get("season")), None
         ):
             season = args_season
+    elif "get_team_leaders" in tool_names:
+        intent = "team_leaders"
+        for r in data:
+            name = r.get("TEAM_NAME")
+            if name and name not in teams:
+                teams.append(str(name))
+        top_n = top_n or resolver.extract_top_n(query)
+        # Metrics for team boards come from the tool's stat arg (the player
+        # metric map has no team vocabulary like defense/ratings).
+        stat_arg = next(
+            (a.get("stat") for a in tool_args if a.get("stat")), None
+        )
+        if stat_arg:
+            metrics_hint = [str(stat_arg).upper()]
+        if args_season := next(
+            (a.get("season") for a in tool_args if a.get("season")), None
+        ):
+            season = args_season
     elif "get_player_career_trend" in tool_names:
         intent = "player_career_trend"
         seasons = [str(r.get("SEASON")) for r in data if r.get("SEASON")]
@@ -379,6 +442,44 @@ def _infer_spec(
     else:
         intent = "player_season_avg"
 
+    # Leaders guardrails (deterministic safety net behind prompt rules 13-14).
+    # Two failure modes seen live, both fixed here for players AND teams:
+    # (a) mixed per_modes: the model calls the tool twice (PerGame + Totals)
+    # and both row sets concatenate into one chart. Keep one mode.
+    # (b) single-entity misfire: "how many threes did GSW make" names ONE team
+    # but got a top-N board. Slice to that entity -> snapshot intent, so the
+    # viz becomes a single_stat card instead of a 10-row leaderboard.
+    if intent in ("league_leaders", "team_leaders"):
+        modes = {str(r.get("PER_MODE")) for r in data if r.get("PER_MODE")}
+        if len(modes) > 1:
+            unified = [r for r in data if str(r.get("PER_MODE")) == per_mode]
+            if unified:
+                data[:] = unified
+        if not resolver.detect_leaders_intent(query) and not resolver.detect_team_leaders_intent(query):
+            # Ranking-flavored questions ("Did GSW make the MOST threes") keep
+            # the board even when they name one entity — the rank context is
+            # the answer. Only plain single-entity questions downgrade.
+            key = None
+            if not resolver.has_ranking_language(query):
+                key = "PLAYER_NAME" if intent == "league_leaders" else "TEAM_NAME"
+            mentioned = resolver.find_named_entities(
+                query, [str(r.get(key)) for r in data if key and r.get(key)]
+            ) if key else []
+            if len(mentioned) == 1:
+                data[:] = [r for r in data if str(r.get(key)) == mentioned[0]]
+                modes = {str(r.get("PER_MODE")) for r in data if r.get("PER_MODE")}
+                if len(modes) > 1:
+                    unified = [r for r in data if str(r.get("PER_MODE")) == per_mode]
+                    if unified:
+                        data[:] = unified
+                top_n = None
+                highlight_season, highlight_note = None, None
+                if intent == "league_leaders":
+                    intent = "player_season_avg"
+                    players = mentioned
+                else:
+                    intent = "team_stats"
+                    teams = mentioned
     # Scope guardrail (deterministic safety net behind prompt rule 12): the LLM
     # sometimes calls a trend tool for an explicit single-season question
     # ("How many threes did Curry make in 2023-24"). When the query is

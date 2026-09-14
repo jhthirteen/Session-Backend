@@ -268,6 +268,36 @@ def resolve_metrics(text: str) -> List[str]:
     return found or ["PTS"]
 
 
+def explicit_metrics(text: str) -> List[str]:
+    """Metric keys the user actually named ([] when nothing matched).
+
+    Unlike resolve_metrics (which defaults to ['PTS']), this distinguishes
+    'how many threes did GSW make' (['FG3M'] -> show the stat) from
+    'how did the celtics do' ([] -> fall back to the record card).
+    """
+    t = text.lower()
+    hits: List[Tuple[int, int, str, int]] = []
+    for phrase in _METRIC_SYNONYMS:
+        key = _METRIC_SYNONYMS[phrase]
+        pat = r"(?<!\w)" + re.escape(phrase.lower()) + r"(?!\w)"
+        for m in re.finditer(pat, t):
+            hits.append((m.start(), m.end(), key, len(phrase)))
+    hits.sort(key=lambda h: -h[3])
+    found: List[str] = []
+    claimed: List[Tuple[int, int]] = []
+    for start, end, key, _plen in hits:
+        if any(start < c_end and end > c_start for c_start, c_end in claimed):
+            continue
+        claimed.append((start, end))
+        if key not in found:
+            found.append(key)
+    return found
+
+
+#: Metric keys that mean "the record" — everything else is a countable stat.
+RECORD_METRICS = frozenset({"W", "L", "W_PCT"})
+
+
 # ---------------------------------------------------------------------------
 # Name resolution (players + teams)
 # ---------------------------------------------------------------------------
@@ -517,6 +547,79 @@ _TOP_N_RE = re.compile(r"\btop\s+(\d{1,2})\b", re.I)
 DEFAULT_LEADERS_TOP_N = 5
 
 
+# ---------------------------------------------------------------------------
+# Team-leader vocabulary: natural phrasing -> team-leader stat key.
+# Kept separate from the player metric map on purpose: "best defense" has no
+# player-stat meaning, and "points" alone must not hijack team queries.
+# Longer phrases first so "fewest points allowed" wins over "points".
+# ---------------------------------------------------------------------------
+_TEAM_LEADER_PHRASES: List[Tuple[str, str]] = [
+    ("fewest points allowed", "OPP_PTS"),
+    ("points allowed", "OPP_PTS"),
+    ("defensive rating", "DEF_RATING"),
+    ("offensive rating", "OFF_RATING"),
+    ("net rating", "NET_RATING"),
+    ("point differential", "NET_RATING"),
+    ("best record", "W"),
+    ("most wins", "W"),
+    ("most games", "W"),
+    ("wins", "W"),
+    ("record", "W"),
+    ("best offense", "PTS"),
+    ("offenses", "PTS"),
+    ("offense", "PTS"),
+    ("offensive", "PTS"),
+    ("best defense", "OPP_PTS"),
+    ("defenses", "OPP_PTS"),
+    ("defense", "OPP_PTS"),
+    ("defensive", "OPP_PTS"),
+    ("three", "FG3M"),
+    ("threes", "FG3M"),
+    ("field goal percentage", "FG_PCT"),
+]
+
+_TEAM_RANK_WORDS_RE = re.compile(
+    r"\b(led|leads|leading|leaders?|most|best|top|highest|lowest|fewest|worst)\b"
+    r"|\bwho\b.{0,20}\b(won|allowed|scored)\b",
+    re.I,
+)
+_TEAM_NOUN_RE = re.compile(
+    r"\bteams?\b|\bwins?\b|\brecord\b|\boffense\b|\bdefense\b|\brating\b"
+    r"|\bdifferential\b|\bpoints allowed\b",
+    re.I,
+)
+
+
+def resolve_team_leader_stat(text: str) -> Optional[str]:
+    """Map team-ranking phrasing to a team-leader stat key (None if no hit)."""
+    t = text.lower()
+    for phrase, key in _TEAM_LEADER_PHRASES:
+        if re.search(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)", t):
+            return key
+    return None
+
+
+def detect_team_leaders_intent(
+    text: str, all_teams: Optional[List[Dict]] = None
+) -> bool:
+    """True for TEAM ranking questions (ranked teams, one stat, one season).
+
+    Requires ranking words + team nouns. A query naming one specific team
+    ('what was the celtics record') is a team_stats question, not a ranking —
+    so any resolvable single-team mention vetoes the detector. Precision over
+    recall: the LLM prompt rule covers what this misses.
+    """
+    if not _TEAM_RANK_WORDS_RE.search(text):
+        return False
+    if not (_TEAM_NOUN_RE.search(text) or resolve_team_leader_stat(text)):
+        return False
+    lowered = text.lower()
+    for alias, canonical in TEAM_ALIASES.items():
+        if re.search(r"(?<!\w)" + re.escape(alias) + r"(?!\w)", lowered):
+            return False
+    return True
+
+
 def detect_comparison_intent(text: str) -> bool:
     """True when the query compares multiple things (entities, seasons, games)."""
     return bool(_COMPARISON_RE.search(text))
@@ -539,6 +642,44 @@ def extract_top_n(text: str, default: int = DEFAULT_LEADERS_TOP_N) -> int:
         except ValueError:
             return default
     return default
+
+
+# Ranking-flavored words. The single-entity leaders guardrail must NOT fire
+# when these appear: "Did the Warriors make the MOST threes" needs the board
+# for context even though it names one team. (Deliberately excludes "last" —
+# that's usually a season reference, and "win/won" — that's record vocabulary.)
+_RANK_WORDS_RE = re.compile(
+    r"\b(led|leads|leading|leaders?|most|best|top|highest|lowest|fewest|worst)\b"
+    r"|\bscoring (title|race|crown)\b",
+    re.I,
+)
+
+
+def has_ranking_language(text: str) -> bool:
+    """True when the query compares against the field (most/best/top/led...)."""
+    return bool(_RANK_WORDS_RE.search(text))
+
+
+def find_named_entities(text: str, names: List[str]) -> List[str]:
+    """Subset of names (canonical, as given) mentioned in the query.
+
+    Matches full names ('Golden State Warriors') or final tokens
+    ('Warriors', 'Brunson') on word boundaries, case-insensitively.
+    Used by the leaders guardrail: exactly one hit means the user asked about
+    ONE entity, not a ranking — general across players and teams.
+    """
+    t = text.lower()
+    found: List[str] = []
+    for name in dict.fromkeys(n for n in names if n):
+        full = str(name)
+        candidates = [full] + full.split()[-1:]
+        for cand in dict.fromkeys(candidates):
+            if len(cand) < 3:
+                continue
+            if re.search(r"(?<!\w)" + re.escape(cand.lower()) + r"(?!\w)", t):
+                found.append(full)
+                break
+    return found
 
 
 def detect_trend_intent(text: str) -> bool:
@@ -669,6 +810,17 @@ def choose_viz_hint(spec: QuerySpec) -> VizHint:
             y_keys=metrics,
             series_key="PLAYER_NAME",
         )
+    if spec.intent == "team_leaders":
+        flavor = "totals" if getattr(spec, "per_mode", "PerGame") == "Totals" else "per game"
+        depth = getattr(spec, "top_n", None) or len(getattr(spec, "teams", None) or []) or ""
+        title = f"{season} NBA team {'/'.join(metrics)} leaders ({flavor}, top {depth})".strip()
+        return VizHint(
+            type="leaderboard",
+            title=title,
+            x_key="TEAM_NAME",
+            y_keys=metrics,
+            series_key="TEAM_NAME",
+        )
     if spec.intent in ("player_career_trend", "team_history_trend"):
         flavor = "totals" if getattr(spec, "per_mode", "PerGame") == "Totals" else "per game"
         window = ""
@@ -727,6 +879,20 @@ def choose_viz_hint(spec: QuerySpec) -> VizHint:
             y_keys=metrics,
         )
     if spec.intent == "team_stats":
+        # Record questions ("celtics record") -> the W-L card. But a team asked
+        # about ANY other stat ("how many threes did GSW make") gets the same
+        # big-number card as a player would — the record card would bury it.
+        # explicit_metrics (not the PTS default) decides, so vague "how did
+        # the celtics do" still falls back to the record card.
+        explicit = explicit_metrics(spec.raw_query or "") if spec.raw_query else []
+        if explicit and any(m not in RECORD_METRICS for m in explicit):
+            stat_keys = [m for m in explicit if m not in RECORD_METRICS] or metrics
+            name = (spec.teams or [label])[0]
+            return VizHint(
+                type="single_stat",
+                title=f"{name} {stat_keys[0]} {season}".strip(),
+                y_keys=stat_keys,
+            )
         return VizHint(
             type="team_stat_card",
             title=f"{label} {season}".strip(),

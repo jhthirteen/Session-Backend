@@ -25,6 +25,7 @@ Intent = Literal[
     "player_career_trend",
     "team_history_trend",
     "league_leaders",
+    "team_leaders",
     "needs_clarification",
 ]
 
@@ -40,6 +41,8 @@ VizType = Literal[
 ]
 
 # Canonical metric keys (match nba_api column names where possible).
+# Includes team-leaderboard stats (OPP_PTS, ratings, PLUS_MINUS) so they flow
+# through spec.metrics / viz y_keys like any other stat.
 MetricKey = Literal[
     "PTS",
     "AST",
@@ -54,6 +57,11 @@ MetricKey = Literal[
     "W",
     "L",
     "W_PCT",
+    "PLUS_MINUS",
+    "OPP_PTS",
+    "OFF_RATING",
+    "DEF_RATING",
+    "NET_RATING",
 ]
 
 

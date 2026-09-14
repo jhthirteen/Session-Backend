@@ -137,3 +137,65 @@ def test_tool_registered():
                   __import__("src.data_tooling.nba_tools", fromlist=["GROQ_TOOL_SCHEMAS"]).GROQ_TOOL_SCHEMAS
                   if s["function"]["name"] == "get_league_leaders")
     assert set(schema["function"]["parameters"]["required"]) == {"stat_category", "season"}
+
+
+# --- leaders guardrails (player mirror of the Sept 7 team screenshot) --------
+def _pts_board():
+    names = ["Shai Gilgeous-Alexander", "Giannis Antetokounmpo", "Nikola Jokic",
+             "Jalen Brunson", "Anthony Edwards"]
+    vals = [32.7, 30.4, 29.6, 26.0, 27.6]
+    return [
+        {"RANK": i + 1, "PLAYER_NAME": n, "TEAM_ABBREVIATION": "OKC",
+         "SEASON": "2024-25", "GP": 70, "PTS": vals[i], "PER_MODE": "PerGame"}
+        for i, n in enumerate(names)
+    ]
+
+
+def test_named_player_downgrades_to_season_avg():
+    data = _pts_board()
+    q = "how many points did jalen brunson average in 2024-25?"
+    spec = agent._infer_spec(
+        q, ["get_league_leaders"],
+        [{"stat_category": "PTS", "season": "2024-25", "top_n": 10}],
+        data, ["PTS"], "2024-25", 10, "PerGame",
+    )
+    assert spec.intent == "player_season_avg"
+    assert spec.players == ["Jalen Brunson"]
+    assert len(data) == 1 and data[0]["PTS"] == 26.0
+    assert R.choose_viz_hint(spec).type == "single_stat"
+
+
+def test_two_named_players_leave_board_alone():
+    data = _pts_board()
+    q = "compare jalen brunson vs anthony edwards in 2024-25"
+    spec = agent._infer_spec(
+        q, ["get_league_leaders"],
+        [{"stat_category": "PTS", "season": "2024-25"}],
+        data, ["PTS"], "2024-25", 10, "PerGame",
+    )
+    assert spec.intent == "league_leaders"
+    assert len(data) == 5
+
+
+def test_best_flavored_single_player_keeps_board():
+    data = _pts_board()
+    q = "Is Brunson the best scorer in the league?"
+    spec = agent._infer_spec(
+        q, ["get_league_leaders"],
+        [{"stat_category": "PTS", "season": "2024-25"}],
+        data, ["PTS"], "2024-25", 10, "PerGame",
+    )
+    assert spec.intent == "league_leaders"
+    assert len(data) == 5
+
+
+def test_true_player_leaders_untouched():
+    data = _pts_board()
+    q = "Who were the top 10 scorers in the NBA in 2024-25?"
+    spec = agent._infer_spec(
+        q, ["get_league_leaders"],
+        [{"stat_category": "PTS", "season": "2024-25", "top_n": 10}],
+        data, ["PTS"], "2024-25", 10, "PerGame",
+    )
+    assert spec.intent == "league_leaders"
+    assert len(data) == 5

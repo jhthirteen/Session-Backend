@@ -3,7 +3,7 @@ NLP Visualizer V1 — Scope and Known Gaps
 (Checkpoint 3 status; generated 2026-09-05. Do not treat this file as a roadmap
 commitment — it is a snapshot of what the toolbelt can and cannot do today.)
 
-HANDLED (11 intents + clarification) — updated 2026-09-07: league leaders built
+HANDLED (12 intents + clarification) — updated 2026-09-07: team leaders built
 --------------------------------------------------------------------------------
 1. player_season_avg   — one player, one season, per-game averages
                           (PlayerCareerStats, PerMode=PerGame)
@@ -34,9 +34,14 @@ HANDLED (11 intents + clarification) — updated 2026-09-07: league leaders buil
                           'top 10 scorers'; viz leaderboard with series_key;
                           PerGame default per title convention, Totals on
                           request; top_n 1-25, default 5 for bare 'led').
+12. team_leaders       — ranked TEAMS × one stat × one season × top N in ONE
+                          LeagueDashTeamStats call ('most wins', 'best
+                          offense/defense/net rating'; same leaderboard viz
+                          with x_key=TEAM_NAME; Base/Opponent/Advanced measures;
+                          defense sorts ascending; top_n 1-25, default 5).
 
-The Groq agent (agent.py) has exactly these 11 tools (nba_tools.py:TOOL_FUNCS).
-It cannot fetch anything else; it can only phrase these 11 in different words.
+The Groq agent (agent.py) has exactly these 12 tools (nba_tools.py:TOOL_FUNCS).
+It cannot fetch anything else; it can only phrase these 12 in different words.
 
 OUT OF SCOPE (will clarify or answer awkwardly)
 ----------------------------------------------
