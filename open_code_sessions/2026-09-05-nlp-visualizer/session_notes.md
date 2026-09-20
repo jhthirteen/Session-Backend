@@ -288,3 +288,48 @@ merged into it via PR #6 early in the session).
 - Offline: 126 passed, 13 skipped (skips are live/gated). No GROQ_API_KEY in
   this shell — LLM end-to-end (tool choice for leaders/team-stat queries) left
   for the user's keyed shell throughout.
+
+---
+
+## Continued session 2026-09-08 — messy NLP: stat normalization + LLM fallbacks
+
+Branch `feature/the_answer`. Trigger: "Show me Steph Curry's 3-point
+percentage vs Luka Doncic's over the last 5 seasons" failed twice over —
+`3-point percentage` parsed as PTS ("point" substring hit), "Steph Curry"
+resolved to nobody.
+
+### Stat spelling normalization (deterministic, general)
+- New `_normalize_stat_text()`: hyphens between word chars become spaces
+  before synonym matching, so ONE entry covers `3-point` / `3 point` /
+  `three-point` / `free-throw` / `field-goal` spellings across all families.
+- Digit-form synonyms: `3 point percentage → FG3_PCT`, `3 point/3 pointers →
+  FG3M`, plus `trey/treys` slang. Deliberate exception: bare `3 points` stays
+  PTS-quantity ("scored 3 points") — wrong-stat chart is worse than default.
+- The example now parses fully: FG3_PCT + comparison + last-5 window.
+
+### Names: nickname map added, then REVERTED (learning)
+- First attempt was a 25-entry PLAYER_NICKNAMES table. User correctly called it
+  overfitting: it duplicates model knowledge and rots with trades/rookies.
+- Final design — resolver owns spelling (exact/substring only), model owns
+  meaning: unknown-name ToolErrors invite ONE retry with the full formal name,
+  prompt rule 6 split (ambiguous+canididates → ask user; unknown → retry formal
+  name, clarify only if that fails). Zero name lists, works for any nickname
+  including post-cutoff players the map could never hold.
+
+### LLM metrics fallback (+ propagation fix)
+- `resolve_metrics_with_fallback()`: deterministic `explicit_metrics()` first
+  (zero cost); only blanks hit the model — one strict-JSON call (temp 0,
+  constrained to valid MetricKeys), cached, garbage/exceptions → PTS default.
+- Audit caught incomplete wiring: viz gate + synthesis re-derived from
+  synonyms, so model-resolved stats still rendered record cards. Fixed with
+  single shared store `resolver.LLM_RESOLVED_METRICS` (stores [] for
+  unmappable so vague stays distinguishable) + `named_stat_metrics()` reader
+  used by BOTH downstream consumers. Agent-local duplicate cache removed.
+- `V1_SCOPE_AND_GAPS.txt` gray-zone updated (fallback replaces silent default).
+
+### Suite status
+- Offline: 149 passed, 13 skipped. New `test_messy_nlp.py` (stat forms +
+  fail-clean names) and `test_metric_fallback.py` (stubbed client: blank→LLM,
+  invalid/empty/exception→default, caching, hint override, viz/synth
+  propagation). No GROQ_API_KEY here — live fallback + name-retry e2e left
+  for the keyed shell.
