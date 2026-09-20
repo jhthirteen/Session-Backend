@@ -100,10 +100,19 @@ def get_player_id(player_name: str) -> int:
                 f"Ambiguous player '{player_name}'. Candidates: {', '.join(candidates)}.",
                 candidates=candidates,
             )
-        raise ToolError(f"Unknown player '{player_name}'. Check spelling.")
+        raise ToolError(
+            f"Unknown player '{player_name}'. If this looks like a nickname, "
+            f"short form, or misspelling, retry ONCE with the player's full "
+            f"formal name (e.g. Steph -> Stephen Curry); otherwise ask the "
+            f"user to clarify."
+        )
     matches = players.find_players_by_full_name(canonical)
     if not matches:
-        raise ToolError(f"Unknown player '{player_name}'. Check spelling.")
+        raise ToolError(
+            f"Unknown player '{player_name}'. If this looks like a nickname, "
+            f"short form, or misspelling, retry ONCE with the player's full "
+            f"formal name; otherwise ask the user to clarify."
+        )
     return matches[0]["id"]
 
 

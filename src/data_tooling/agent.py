@@ -12,17 +12,86 @@ import datetime
 import inspect
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, get_args
 
 from groq import Groq
 
 from . import resolver
-from .models import QueryResponse, QuerySpec, ToolCallTrace
+from .models import MetricKey, QueryResponse, QuerySpec, ToolCallTrace
 from .nba_tools import GROQ_TOOL_SCHEMAS, TOOL_FUNCS, ToolError
 from .resolver import choose_viz_hint
 
 DEFAULT_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 MAX_ITERS = 6
+
+#: Canonical stat keys the model may choose in the metrics fallback.
+VALID_METRIC_KEYS = sorted(set(get_args(MetricKey)))
+
+METRIC_FALLBACK_SYSTEM = (
+    "You map a basketball fan's stat phrasing to canonical keys. Reply with "
+    "JSON {\"metrics\": [...]} using ONLY these keys: "
+    + ", ".join(sorted(set(get_args(MetricKey))))
+    + ". Pick 1-2 keys, most important first (e.g. 'boards' -> [\"REB\"], "
+    + "'swats' -> [\"BLK\"]). "
+    "If the query names no stat or you cannot map it, reply {\"metrics\": []}. "
+    "No other text."
+)
+
+
+def _llm_resolve_metrics(
+    query: str, client: Any, model: str
+) -> Optional[List[str]]:
+    """Ask the model which canonical stat key(s) the query wants.
+
+    Returns None when unmappable or on any failure — the caller keeps the
+    PTS default. Never raises: a helper must not break the main loop.
+    """
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": METRIC_FALLBACK_SYSTEM},
+                {"role": "user", "content": query},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.0,
+        )
+        parsed = json.loads(resp.choices[0].message.content or "{}")
+        raw = parsed.get("metrics", [])
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, list):
+            return None
+        valid = set(VALID_METRIC_KEYS)
+        out = [str(m).upper() for m in raw if str(m).upper() in valid]
+        return out or None
+    except Exception:
+        return None
+
+
+def resolve_metrics_with_fallback(
+    query: str, client: Optional[Any] = None, model: Optional[str] = None
+) -> List[str]:
+    """Metrics for a query: deterministic match first, LLM fallback on blank.
+
+    The resolver owns spelling variants (hyphens, digits, synonyms) — pure
+    Python, no cost. Only when it matches NOTHING does the model interpret
+    the phrasing (slang, novel stats), once per unique query (cached in the
+    shared resolver store so viz + synthesis see the same answer). No client
+    (offline/tests) or unmappable phrasing → the PTS default. The shared
+    store keeps [] for unmappable (meaning "none named") rather than the
+    default, so downstream gates can still tell vague from explicit.
+    """
+    explicit = resolver.explicit_metrics(query)
+    if explicit:
+        return explicit
+    if query in resolver.LLM_RESOLVED_METRICS:
+        return resolver.LLM_RESOLVED_METRICS[query] or ["PTS"]
+    resolved: List[str] = []
+    if client is not None:
+        resolved = _llm_resolve_metrics(query, client, model or DEFAULT_MODEL) or []
+    resolver.LLM_RESOLVED_METRICS[query] = resolved
+    return resolved or ["PTS"]
 
 SYSTEM_PROMPT = """You are an NBA stats analyst powering a data-visualization hub. \
 Answer ONLY using data returned from the provided tools — never invent stats.
@@ -36,7 +105,12 @@ over his career, progression, most improved, totals across seasons, wins by year
 call get_player_career_trend or get_team_history_trend ONCE — NEVER loop single-season \
 tools per season. One bulk call returns the whole history.
 5. per_mode: use 'Totals' only when the user says totals/combined/altogether; default 'PerGame'.
-6. If a tool reports ambiguous/unknown names, STOP and ask the user to clarify — do not guess.
+6. Fuzzy names are YOUR job, not the resolver's: it only matches exact/substring \
+against the official roster. If a tool reports AMBIGUOUS (with candidates), STOP and \
+ask the user to pick — do not guess. If it reports UNKNOWN (no candidates) and the \
+mention looks like a nickname, short form, or misspelling, retry ONCE with the \
+player's full formal name from your own knowledge (Steph -> Stephen Curry) and only \
+ask the user if that retry also fails.
 7. Keep the final answer to 1-2 sentences with the key numbers; the frontend renders charts from the data.
 8. Regular season only unless the user says playoffs.
 9. When calling tools, OMIT optional parameters you don't need — never send null. \
@@ -72,9 +146,14 @@ get_team_stats, even though it says 'how many').
 """
 
 
-def _build_user_content(query: str, today: datetime.date) -> str:
+def _build_user_content(
+    query: str,
+    today: datetime.date,
+    metrics_hint: Optional[List[str]] = None,
+) -> str:
     season_hint = resolver.resolve_season(query, today)
-    metrics_hint = resolver.resolve_metrics(query)
+    if metrics_hint is None:
+        metrics_hint = resolver.resolve_metrics(query)
     last_n_hint = resolver.extract_last_n(query)
     per_mode_hint = resolver.resolve_per_mode(query)
     window = resolver.resolve_season_window(query, today)
@@ -296,11 +375,11 @@ def _synthesize_answer(
             r = data[0]
             name = r.get("TEAM_NAME", "Unknown")
             season = r.get("SEASON", "")
-            # Any explicitly-named non-record stat leads ("... made 1,264
-            # FG3M ..."); record questions keep the W-L phrasing. General
-            # across stats — driven by the query's own vocabulary.
-            explicit = resolver.explicit_metrics(query)
-            stats = [m for m in explicit if m not in resolver.RECORD_METRICS]
+            # Any named non-record stat leads ("... made 1,264 FG3M ...");
+            # record questions keep the W-L phrasing. Named covers
+            # LLM-resolved stats too, via the shared fallback store.
+            named = resolver.named_stat_metrics(query)
+            stats = [m for m in named if m not in resolver.RECORD_METRICS]
             if stats:
                 bits = []
                 for m in stats:
@@ -532,12 +611,14 @@ def run_query(
     model = model or DEFAULT_MODEL
     client = client or Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-    metrics_hint = resolver.resolve_metrics(query)
+    # Deterministic match first; LLM fallback only when nothing matches.
+    metrics_hint = resolve_metrics_with_fallback(query, client, model)
     last_n_hint = resolver.extract_last_n(query)
 
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": _build_user_content(query, today)},
+        {"role": "user", "content": _build_user_content(
+            query, today, metrics_hint=metrics_hint)},
     ]
 
     traces: List[ToolCallTrace] = []

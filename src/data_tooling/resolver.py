@@ -180,6 +180,23 @@ def extract_last_n(text: str, default: int = 10) -> int:
 # ---------------------------------------------------------------------------
 # Metric synonyms -> canonical keys
 # ---------------------------------------------------------------------------
+_HYPHEN_RE = re.compile(r"(?<=\w)[\-–—](?=\w)")
+
+
+def _normalize_stat_text(text: str) -> str:
+    """Messy-NLP normalization run before synonym matching.
+
+    Hyphenated spellings ('3-point', 'three-point', 'free-throw',
+    'field-goal') collapse to space-separated form so ONE synonym covers every
+    spelling — general across stat families, not a per-phrase enumeration.
+    Note bare '3 points' is deliberately NOT a threes synonym: without the
+    -er/-point-marker it reads as a quantity ('scored 3 points'), and a
+    wrong-stat chart is worse than the PTS default.
+    """
+    t = _HYPHEN_RE.sub(" ", text.lower())
+    return re.sub(r"\s+", " ", t).strip()
+
+
 _METRIC_SYNONYMS: Dict[str, str] = {
     # points
     "point": "PTS",
@@ -211,18 +228,18 @@ _METRIC_SYNONYMS: Dict[str, str] = {
     "fg%": "FG_PCT",
     "field goal": "FG_PCT",
     "three point percentage": "FG3_PCT",
-    "three-pointer": "FG3M",
-    "three-pointers": "FG3M",
+    "3 point percentage": "FG3_PCT",
+    "3p%": "FG3_PCT",
     "three pointer": "FG3M",
     "three pointers": "FG3M",
+    "3 pointers": "FG3M",
+    "3 point": "FG3M",
     "three": "FG3M",
     "threes": "FG3M",
-    "3-pointer": "FG3M",
-    "3 pointers": "FG3M",
+    "trey": "FG3M",
+    "treys": "FG3M",
     "3pt": "FG3M",
     "3pm": "FG3M",
-    "three point percentage": "FG3_PCT",
-    "3p%": "FG3_PCT",
     "free throw percentage": "FT_PCT",
     "ft%": "FT_PCT",
     "minutes": "MIN",
@@ -247,7 +264,7 @@ def resolve_metrics(text: str) -> List[str]:
     Longer phrases win and suppress overlapping shorter ones, so
     'three point percentage' yields FG3_PCT without also yielding FG3M.
     """
-    t = text.lower()
+    t = _normalize_stat_text(text)
     # Collect (start, end, key, phrase_len) for every synonym hit.
     hits: List[Tuple[int, int, str, int]] = []
     for phrase in _METRIC_SYNONYMS:
@@ -275,7 +292,7 @@ def explicit_metrics(text: str) -> List[str]:
     'how many threes did GSW make' (['FG3M'] -> show the stat) from
     'how did the celtics do' ([] -> fall back to the record card).
     """
-    t = text.lower()
+    t = _normalize_stat_text(text)
     hits: List[Tuple[int, int, str, int]] = []
     for phrase in _METRIC_SYNONYMS:
         key = _METRIC_SYNONYMS[phrase]
@@ -296,6 +313,25 @@ def explicit_metrics(text: str) -> List[str]:
 
 #: Metric keys that mean "the record" — everything else is a countable stat.
 RECORD_METRICS = frozenset({"W", "L", "W_PCT"})
+
+#: LLM-resolved metrics by raw query, written by the agent fallback
+# (resolve_metrics_with_fallback) so downstream readers — viz hints,
+# synthesis — see the same answer without a second model call. Single store
+# on purpose: two caches would drift.
+LLM_RESOLVED_METRICS: Dict[str, List[str]] = {}
+
+
+def named_stat_metrics(text: str) -> List[str]:
+    """Metrics the query actually named — deterministic or LLM-resolved.
+
+    [] means none (the PTS default applies, e.g. 'how did the celtics do').
+    Reads the shared fallback cache, so a model-resolved stat ('rim
+    protection' -> BLK) drives viz + synthesis exactly like a synonym hit.
+    """
+    explicit = explicit_metrics(text)
+    if explicit:
+        return explicit
+    return list(LLM_RESOLVED_METRICS.get(text, []))
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +461,11 @@ def resolve_player(
     - Multiple matches            -> (None, [up to 5 candidates]) — caller
       must ask for clarification, never guess.
     - No match                    -> (None, [])
+
+    Deliberately no nickname map: fuzzy matching (Steph → Stephen, KD, Wemby)
+    belongs to the LLM, which retries with the formal name when the tool
+    reports unknown (see agent rule 6). A hardcoded list would rot with every
+    trade, rookie class, and model-knowledge update.
     """
     if all_players is None:
         try:
@@ -882,11 +923,12 @@ def choose_viz_hint(spec: QuerySpec) -> VizHint:
         # Record questions ("celtics record") -> the W-L card. But a team asked
         # about ANY other stat ("how many threes did GSW make") gets the same
         # big-number card as a player would — the record card would bury it.
-        # explicit_metrics (not the PTS default) decides, so vague "how did
-        # the celtics do" still falls back to the record card.
-        explicit = explicit_metrics(spec.raw_query or "") if spec.raw_query else []
-        if explicit and any(m not in RECORD_METRICS for m in explicit):
-            stat_keys = [m for m in explicit if m not in RECORD_METRICS] or metrics
+        # named_stat_metrics (not the PTS default) decides, so vague "how did
+        # the celtics do" still falls back to the record card. Named covers
+        # LLM-resolved stats too ("rim protection" -> BLK), not just synonyms.
+        named = named_stat_metrics(spec.raw_query or "") if spec.raw_query else []
+        if named and any(m not in RECORD_METRICS for m in named):
+            stat_keys = [m for m in named if m not in RECORD_METRICS] or metrics
             name = (spec.teams or [label])[0]
             return VizHint(
                 type="single_stat",

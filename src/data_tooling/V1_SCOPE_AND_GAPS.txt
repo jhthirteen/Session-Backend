@@ -78,8 +78,11 @@ GRAY ZONE (works, but loosely — tighten only on request)
 - Bare last names ("brunson") — Groq infers the famous active player (Jalen)
   instead of forcing disambiguation (Jalen vs Rick). Good UX, softens the
   "never guess" rule. Tighten via system prompt if strictness is preferred.
-- Metric synonyms outside the map ("double-doubles", "efficiency") fall back
-  to PTS default or nearest key.
+- Metric phrasing outside the synonym map ("double-doubles", "rim protection")
+  goes to a one-shot LLM classifier (cached per query, constrained to valid
+  MetricKeys, degrades to PTS on garbage/failure) — deterministic match first,
+  model interprets only blanks. Same division as names: resolver owns
+  spelling, model owns meaning.
 - Unknown names ("Mickey Mouse") correctly return needs_clarification with
   zero rows and no hallucinated stats (verified live).
 
