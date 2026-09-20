@@ -1,1 +1,3 @@
 .venv
+./src/data_tooling/__pycache__/*
+.pytest_cahche

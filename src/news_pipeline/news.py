@@ -25,7 +25,7 @@ class ArticleClassification(BaseModel):
         description="Brief 1-sentence justification."
     )
 
-def fetch_espn_rss_news_past_day() -> list:
+def fetch_espn_rss_feed_past_day() -> list:
     espn_rss_url = 'https://www.espn.com/espn/rss/nba/news'
     current_utc_time = time.gmtime()
     # convert time.struct_type to datetime for timestamp arithmetic 
@@ -60,12 +60,14 @@ def classify_headline(title: str, client: Groq) -> ArticleClassification:
     return ArticleClassification(**data)
 
 
-def filter_news_feed_for_stories(stories: list) -> None:
+def filter_rss_feed_for_news(stories: list) -> list:
     client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
+    news_stories = []
     for story in stories:
         result = classify_headline(story.title, client)
-        print(f'Story: {story.title} is classified as {result.category} with the following rationale: {result.reasoning}')
+        if result.category == "News":
+            news_stories.append(story)
 
-filter_news_feed_for_stories(fetch_espn_rss_news_past_day())
-
+    return news_stories
+filter_rss_feed_for_news(fetch_espn_rss_feed_past_day())
